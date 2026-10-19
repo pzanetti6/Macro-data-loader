@@ -499,7 +499,7 @@ eu_labels={
     "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
     "hicp_level":"HICP level","hicp_rate":"HICP inflation","unemployment_rate":"Unemployment rate",
     "ip":"Industrial production","log_ip":"Log industrial production","energy_index":"Energy price index (HICP)",
-    "house_price_index":"House / real estate price index",
+    "house_price_index":"Real estate / house price index",
     "estr":"€STR","dfr":"Deposit facility rate (DFR)","mro":"Main refinancing operations rate (MRO)",
     "aaa_1y":"EA AAA 1Y spot yield","aaa_10y":"EA AAA 10Y spot yield",
     "sovereign_1y":"Sovereign 1Y yield","sovereign_10y":"Sovereign 10Y yield",
@@ -510,7 +510,7 @@ us_labels={
     "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
     "cpi_level":"CPI level","inflation_rate":"CPI inflation","unemployment_rate":"Unemployment rate",
     "ip":"Industrial production","log_ip":"Log industrial production","energy_cpi":"Energy price index (CPI)",
-    "house_price_index":"House / real estate price index",
+    "house_price_index":"Real estate / house price index",
     "fed_funds":"Effective federal funds rate","sofr":"SOFR",
     "treasury_1y":"US Treasury 1Y yield","treasury_10y":"US Treasury 10Y yield",
     "sp500":"S&P 500","djia":"Dow Jones Industrial Average",
@@ -558,32 +558,34 @@ else:
     }
 
 st.caption("Choose the series you want by category. Nothing is selected by default; click a pill to add it.")
-_group_cols = st.columns(3)
 selected_vars = []
 _group_help = {
     "Macro": "Activity, prices, production and labour-market indicators",
     "Rates & Money": "Policy, money-market and government-bond rates",
-    "Financial / Other Indexes": "Equity, house / real-estate and energy price indices",
+    "Financial / Other Indexes": "Equity, real-estate and energy price indices",
 }
-for _col, (_group_name, _group_vars) in zip(_group_cols, variable_groups.items()):
+# Stack the category cards vertically so every pill is always visible.  In the
+# previous three-column layout the Financial / Other Indexes card could become
+# too narrow on Streamlit Cloud, making later pills (notably the HPI) easy to
+# miss/off-screen.
+for _group_name, _group_vars in variable_groups.items():
     _opts = [v for v in _group_vars if v in available_vars]
-    with _col:
-        with st.container(border=True):
-            st.markdown(f"**{_group_name}**")
-            st.caption(_group_help[_group_name])
-            if _opts:
-                _picked = st.pills(
-                    f"{_group_name} series",
-                    _opts,
-                    default=[],
-                    selection_mode="multi",
-                    format_func=lambda x: labels.get(x, x.replace("_", " ").title()),
-                    key=f"vars_{geography}_{_group_name}",
-                    label_visibility="collapsed",
-                )
-                selected_vars.extend(_picked or [])
-            else:
-                st.caption("No series available for this dataset.")
+    with st.container(border=True):
+        st.markdown(f"**{_group_name}**")
+        st.caption(_group_help[_group_name])
+        if _opts:
+            _picked = st.pills(
+                f"{_group_name} series",
+                _opts,
+                default=[],
+                selection_mode="multi",
+                format_func=lambda x: labels.get(x, x.replace("_", " ").title()),
+                key=f"vars_{geography}_{_group_name}",
+                label_visibility="collapsed",
+            )
+            selected_vars.extend(_picked or [])
+        else:
+            st.caption("No series available for this dataset.")
 
 st.caption(f"{len(selected_vars)} of {len(available_vars)} available series selected.")
 
