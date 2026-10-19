@@ -1064,57 +1064,78 @@ def _fred_series(series_id: str, start_year: int, end_year: int) -> pd.Series:
         return out
 
 
-def _fred_market_series(series_id: str, start_year: int, end_year: int, freq: str) -> pd.Series:
-    """Download a daily FRED market index already aggregated by FRED.
+def _yahoo_market_series(symbol: str, start_year: int, end_year: int, freq: str) -> pd.Series:
+    """Download US equity benchmarks from Yahoo Finance's chart endpoint.
 
-    This avoids transferring thousands of daily observations to Streamlit Cloud.
-    FRED's graph endpoint supports lower-frequency aggregation; we request the
-    user's target frequency directly and use arithmetic averages, matching the
-    app's period-average convention.
+    FRED's public CSV endpoint can be slow/unreliable from Streamlit Cloud for
+    S&P/Dow market series. Yahoo's chart endpoint returns compact monthly bars,
+    so the app never transfers the full daily history. Monthly output is the
+    month-end close; quarterly/annual output is the arithmetic mean of those
+    monthly closes. Requests fail fast and retry briefly so the UI cannot hang
+    for minutes on an unavailable market-data host.
     """
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-    fq = {"M": "Monthly", "Q": "Quarterly", "A": "Annual"}[freq]
-    params = {
-        "id": series_id,
-        "cosd": f"{start_year}-01-01",
-        "coed": f"{end_year}-12-31",
-        "fq": fq,
-        "fam": "avg",
-    }
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Macro-Data-Updater/1.0"})
-    transient = {429, 500, 502, 503, 504}
-    last_error = None
-    for attempt in range(4):
-        try:
-            r = session.get(url, params=params, timeout=(8, 30))
-            if r.status_code == 200:
-                df = pd.read_csv(io.StringIO(r.text))
-                if df.empty or series_id not in df.columns:
-                    raise DataError(f"FRED {series_id}: no observations returned.")
-                dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-                vals = pd.to_numeric(df[series_id], errors="coerce")
-                x = pd.Series(vals.values, index=dt).dropna()
-                x = x[~x.index.isna()].sort_index()
-                if x.empty:
-                    raise DataError(f"FRED {series_id}: no numeric observations returned.")
-                # The endpoint has already aggregated the daily observations.
-                if freq == "M":
-                    idx = x.index.to_period("M")
-                elif freq == "Q":
-                    idx = x.index.to_period("Q")
-                else:
-                    idx = x.index.to_period("Y")
-                return pd.Series(x.values, index=idx).groupby(level=0).last()
-            if r.status_code not in transient:
-                raise DataError(f"FRED {series_id} returned HTTP {r.status_code}.")
-            last_error = f"HTTP {r.status_code}"
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            last_error = str(exc)
-        if attempt < 3:
-            time.sleep(min(1.0 * (2 ** attempt), 8))
-    raise DataError(f"FRED {series_id}: market-data request failed after retries ({last_error}).")
+    from datetime import datetime, timezone
+    from urllib.parse import quote
 
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}"
+    period1 = int(datetime(start_year, 1, 1, tzinfo=timezone.utc).timestamp())
+    # Yahoo period2 is exclusive; include the full requested final year.
+    period2 = int(datetime(end_year + 1, 1, 2, tzinfo=timezone.utc).timestamp())
+    params = {
+        "period1": period1,
+        "period2": period2,
+        "interval": "1mo",
+        "events": "history",
+        "includeAdjustedClose": "true",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; Macro-Data-Updater/1.0)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=(5, 12))
+            if r.status_code == 200:
+                payload = r.json()
+                chart = payload.get("chart", {})
+                if chart.get("error"):
+                    raise DataError(f"Yahoo Finance {symbol}: {chart['error']}")
+                results = chart.get("result") or []
+                if not results:
+                    raise DataError(f"Yahoo Finance {symbol}: no observations returned.")
+                result = results[0]
+                stamps = result.get("timestamp") or []
+                quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+                closes = quotes.get("close") or []
+                if not stamps or not closes:
+                    raise DataError(f"Yahoo Finance {symbol}: no closing-price observations returned.")
+                n = min(len(stamps), len(closes))
+                dt = pd.to_datetime(stamps[:n], unit="s", utc=True).tz_convert(None)
+                vals = pd.to_numeric(pd.Series(closes[:n]), errors="coerce").to_numpy()
+                monthly = pd.Series(vals, index=dt).dropna()
+                monthly = monthly[(monthly.index.year >= start_year) & (monthly.index.year <= end_year)]
+                monthly = pd.Series(monthly.values, index=monthly.index.to_period("M")).groupby(level=0).last()
+                if monthly.empty:
+                    raise DataError(f"Yahoo Finance {symbol}: no numeric observations returned.")
+                if freq == "M":
+                    return monthly
+                if freq == "Q":
+                    return monthly.groupby(monthly.index.asfreq("Q")).mean()
+                if freq == "A":
+                    return monthly.groupby(monthly.index.asfreq("Y")).mean()
+                raise ValueError(freq)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_error = f"HTTP {r.status_code}"
+            else:
+                raise DataError(f"Yahoo Finance {symbol} returned HTTP {r.status_code}.")
+        except DataError:
+            raise
+        except (requests.Timeout, requests.ConnectionError, ValueError, KeyError) as exc:
+            last_error = str(exc)
+        if attempt < 2:
+            time.sleep(1.0 * (2 ** attempt))
+    raise DataError(f"Yahoo Finance {symbol}: market-data request failed after retries ({last_error}).")
 
 def _dated_to_period(s: pd.Series, freq: str, native: str) -> pd.Series:
     """Convert dated US series to requested M/Q/A frequency using period averages."""
@@ -1265,14 +1286,16 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     # US equity benchmarks: daily closing price indices distributed through FRED.
     # Aggregate by arithmetic mean within month/quarter/year for consistency with
     # the ECB EURO STOXX period-average convention.
-    for var, sid, label in [("sp500", "SP500", "S&P 500"), ("djia", "DJIA", "Dow Jones Industrial Average")]:
+    for var, symbol, label in [("sp500", "^GSPC", "S&P 500"), ("djia", "^DJI", "Dow Jones Industrial Average")]:
         if var in vars_set:
-            s = _fred_market_series(sid, start_year, end_year, freq)
+            s = _yahoo_market_series(symbol, start_year, end_year, freq)
             data[var] = s
-            sources[var] = f"S&P Dow Jones Indices via FRED · {sid}"
-            meta.append(FetchMeta(label, "S&P Dow Jones Indices via FRED", sid, "US", "D",
-                                  str(s.dropna().index.max()) if not s.dropna().empty else None,
-                                  "FRED server-side arithmetic average of daily closes at the requested frequency; avoids downloading the full daily series. FRED licensing may limit historical coverage."))
+            sources[var] = f"Yahoo Finance · {symbol}"
+            note = ("Monthly month-end closing index from Yahoo Finance. "
+                    "Quarterly/annual values are arithmetic means of monthly closes. "
+                    "Compact monthly retrieval avoids the slow FRED market-data route.")
+            meta.append(FetchMeta(label, "Yahoo Finance", symbol, "US", "M",
+                                  str(s.dropna().index.max()) if not s.dropna().empty else None, note))
 
     target=_period_range(freq,start_year,end_year)
     out=pd.DataFrame(index=target)
