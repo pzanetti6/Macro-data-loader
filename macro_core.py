@@ -968,7 +968,7 @@ def fetch_macro_dataset(
 
     # Equity indices. EURO STOXX 50 is common to the euro-area/country outputs.
     # Individual-country output additionally uses the OECD harmonised national
-    # share-price index (via FRED) when available.
+    # share-price index directly from the OECD SDMX API.
     if "eurostoxx50" in vars_set:
         try:
             sx5e, sx5e_sid = _fetch_eurostoxx50(ecb, freq, start_year, end_year)
@@ -982,10 +982,10 @@ def fetch_macro_dataset(
     if "country_equity_index" in vars_set and not requested_ea:
         eq, eq_sid = _fetch_country_equity_index(actual_geo, freq, start_year, end_year)
         data["country_equity_index"] = eq
-        sources["country_equity_index"] = ("OECD via FRED" if not eq.empty else "Unavailable")
-        add_meta("Country equity index", "OECD via FRED" if not eq.empty else "Unavailable",
+        sources["country_equity_index"] = ("OECD" if not eq.empty else "Unavailable")
+        add_meta("Country equity index", "OECD" if not eq.empty else "Unavailable",
                  eq_sid, "M", eq,
-                 "OECD Main Economic Indicators national share-price index (2015=100 where applicable); monthly observations averaged to the requested lower frequency. Left blank when no comparable OECD series exists.")
+                 "OECD Financial Market harmonised national share-price index, retrieved directly through the OECD SDMX API. Monthly observations are averaged for quarterly/annual output; unavailable country series are left blank.")
 
     target = _period_range(freq, start_year, end_year)
     out = pd.DataFrame(index=target)
@@ -1155,44 +1155,8 @@ def _dated_to_period(s: pd.Series, freq: str, native: str) -> pd.Series:
 
 
 
-# Main national equity benchmarks used for euro-area country datasets.
-# Yahoo Finance symbols are used here because the previous OECD/FRED country
-# route was unreliable from Streamlit Cloud. EURO STOXX 50 remains on ECB.
-# Countries without a reliable Yahoo benchmark mapping fall back to the OECD
-# harmonised share-price series rather than silently substituting another country.
-_COUNTRY_EQUITY_YAHOO = {
-    "AT": ("^ATX", "ATX"),
-    "BE": ("^BFX", "BEL 20"),
-    "DE": ("^GDAXI", "DAX"),
-    "EL": ("^ATG", "Athens General Composite"),
-    "ES": ("^IBEX", "IBEX 35"),
-    "FI": ("^OMXH25", "OMX Helsinki 25"),
-    "FR": ("^FCHI", "CAC 40"),
-    "IE": ("^ISEQ", "ISEQ Overall"),
-    "IT": ("FTSEMIB.MI", "FTSE MIB"),
-    "NL": ("^AEX", "AEX"),
-    "PT": ("PSI20.LS", "PSI"),
-    "EE": ("^OMXT", "OMX Tallinn"),
-    "LV": ("^OMXR", "OMX Riga"),
-    "LT": ("^OMXV", "OMX Vilnius"),
-}
-
-# Fallback for countries for which Yahoo does not expose a stable national
-# benchmark symbol. This preserves coverage without making FRED the primary
-# route for the large-country indices.
-_OECD_EQUITY_CODE = {
-    "AT": "AT", "BE": "BE", "CY": "CY", "DE": "DE", "EL": "GR", "ES": "ES",
-    "FI": "FI", "FR": "FR", "IE": "IE", "IT": "IT", "LT": "LT",
-    "LU": "LU", "LV": "LV", "MT": "MT", "NL": "NL", "PT": "PT",
-    "SI": "SI", "SK": "SK", "EE": "EE",
-}
-
 def _daily_market_to_target(s: pd.Series, freq: str) -> pd.Series:
-    """Aggregate daily market closes to the requested frequency by arithmetic mean.
-
-    This matches the ECB EURO STOXX convention used here (average of observations
-    through the period), so US and European equity series are frequency-comparable.
-    """
+    """Aggregate daily market closes to the requested frequency by arithmetic mean."""
     x = pd.Series(pd.to_numeric(s.values, errors="coerce"), index=pd.to_datetime(s.index, errors="coerce")).dropna()
     x = x[~x.index.isna()].sort_index()
     if freq == "M":
@@ -1203,44 +1167,113 @@ def _daily_market_to_target(s: pd.Series, freq: str) -> pd.Series:
         return x.groupby(x.index.to_period("Y")).mean()
     raise ValueError(freq)
 
+
 def _fetch_eurostoxx50(ecb: ECBClient, freq: str, start_year: int, end_year: int) -> tuple[pd.Series, str]:
     """EURO STOXX 50 from the ECB Real Time Database, monthly period-average close."""
     key = "M.S0.N.C_DJE50.X"
     s = _ecb_monthly_to_target(ecb, "RTD", key, freq, start_year, end_year)
     return s, f"RTD.{key}"
 
-def _fetch_country_equity_index(country: str, freq: str, start_year: int, end_year: int) -> tuple[pd.Series, str]:
-    """Fetch the country's main national equity benchmark.
 
-    Primary route: Yahoo Finance monthly bars for the actual headline national
-    index (DAX, CAC 40, FTSE MIB, IBEX 35, AEX, etc.). This fixes the previous
-    country-equity bug caused by relying on OECD/FRED identifiers that were often
-    unavailable or slow from Streamlit Cloud. For smaller EA markets without a
-    stable Yahoo benchmark mapping, retain the OECD/FRED harmonised index as a
-    fallback. Missing data stay missing; no cross-country substitution is made.
+# ISO-3 codes used by the OECD Financial Market dataset.
+# Greece is EL internally in the app but GRC at the OECD boundary.
+_OECD_COUNTRY3 = {
+    "AT": "AUT", "BE": "BEL", "CY": "CYP", "DE": "DEU", "EE": "EST",
+    "EL": "GRC", "ES": "ESP", "FI": "FIN", "FR": "FRA", "IE": "IRL",
+    "IT": "ITA", "LT": "LTU", "LU": "LUX", "LV": "LVA", "MT": "MLT",
+    "NL": "NLD", "PT": "PRT", "SI": "SVN", "SK": "SVK",
+}
+
+
+def _oecd_country_equity_monthly(country: str, start_year: int, end_year: int) -> pd.Series:
+    """Download the OECD harmonised national share-price index directly via SDMX.
+
+    Dataset: OECD.SDD.STES, DSD_STES@DF_FINMARK, version 4.0
+    Selection: <country>.M.SHARE.IX.....
+
+    Direct OECD access avoids the former Yahoo ticker-by-ticker route and the
+    FRED mirror.  The query is deliberately narrow (one country, one measure,
+    requested dates only) so country-panel downloads remain small.
     """
-    mapped = _COUNTRY_EQUITY_YAHOO.get(country)
-    if mapped:
-        symbol, name = mapped
-        try:
-            s = _yahoo_market_series(symbol, start_year, end_year, freq)
-            if not s.empty:
-                return s, f"Yahoo Finance {symbol} ({name})"
-        except Exception:
-            pass
+    iso3 = _OECD_COUNTRY3.get(country)
+    if not iso3:
+        return pd.Series(dtype=float)
 
-    cc = _OECD_EQUITY_CODE.get(country)
-    if cc:
-        sid = f"SPASTT01{cc}M661N"
-        try:
-            raw = _fred_series(sid, start_year, end_year)
-            s = _dated_to_period(raw, freq, "M")
-            if not s.empty:
-                return s, f"OECD via FRED {sid}"
-        except Exception:
-            pass
+    key = f"{iso3}.M.SHARE.IX....."
+    url = (
+        "https://sdmx.oecd.org/public/rest/data/"
+        f"OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0/{key}"
+    )
+    params = {
+        "startPeriod": f"{start_year}-01",
+        "endPeriod": f"{end_year}-12",
+        "dimensionAtObservation": "AllDimensions",
+        "format": "csvfile",
+    }
+    headers = {
+        "User-Agent": "Macro-Data-Updater/1.0",
+        "Accept": "text/csv,application/vnd.sdmx.data+csv;q=0.9,*/*;q=0.1",
+    }
 
-    return pd.Series(dtype=float), "National equity benchmark unavailable"
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=(8, 20))
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"OECD HTTP {r.status_code}", response=r)
+            r.raise_for_status()
+            if not r.content.strip():
+                return pd.Series(dtype=float)
+
+            df = pd.read_csv(io.BytesIO(r.content))
+            if df.empty:
+                return pd.Series(dtype=float)
+
+            # SDMX CSV normally exposes TIME_PERIOD and OBS_VALUE.  Keep the
+            # parser tolerant to casing/label variants in case OECD changes the
+            # CSV flavour while preserving the underlying SDMX dimensions.
+            cols = {str(c).upper(): c for c in df.columns}
+            tcol = cols.get("TIME_PERIOD")
+            vcol = cols.get("OBS_VALUE")
+            if tcol is None or vcol is None:
+                raise DataError(
+                    f"OECD national equity response has unexpected columns: {list(df.columns)[:12]}"
+                )
+
+            periods = pd.PeriodIndex(df[tcol].astype(str), freq="M")
+            values = pd.to_numeric(df[vcol], errors="coerce").to_numpy()
+            out = pd.Series(values, index=periods, dtype=float).dropna()
+            return out[~out.index.duplicated(keep="last")].sort_index()
+        except (requests.RequestException, DataError, ValueError, pd.errors.ParserError) as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(1.5 * (2 ** attempt))
+
+    raise DataError(f"OECD national share-price request failed for {iso3}: {last_exc}")
+
+
+def _fetch_country_equity_index(country: str, freq: str, start_year: int, end_year: int) -> tuple[pd.Series, str]:
+    """Fetch a harmonised national share-price index directly from OECD.
+
+    Monthly OECD observations are returned as-is. Quarterly and annual series
+    are arithmetic averages of those monthly observations, matching the app's
+    period-average convention for EURO STOXX 50 and other financial series.
+    """
+    monthly = _oecd_country_equity_monthly(country, start_year, end_year)
+    if monthly.empty:
+        return pd.Series(dtype=float), "OECD national share-price index unavailable"
+
+    if freq == "M":
+        out = monthly
+    elif freq == "Q":
+        out = monthly.groupby(monthly.index.asfreq("Q")).mean()
+    elif freq == "A":
+        out = monthly.groupby(monthly.index.asfreq("Y")).mean()
+    else:
+        raise ValueError(freq)
+
+    iso3 = _OECD_COUNTRY3.get(country, country)
+    return out, f"OECD DSD_STES@DF_FINMARK 4.0 {iso3}.M.SHARE.IX"
 
 
 def fetch_us_dataset(freq: str, start_year: int, end_year: int,
