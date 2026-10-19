@@ -1,8 +1,0 @@
-.venv/
-.conda-python311/
-__pycache__/
-*.py[cod]
-.DS_Store
-.streamlit/secrets.toml
-*.log
-~$*.xlsx
