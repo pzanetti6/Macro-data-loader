@@ -499,7 +499,7 @@ eu_labels={
     "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
     "hicp_level":"HICP level","hicp_rate":"HICP inflation","unemployment_rate":"Unemployment rate",
     "ip":"Industrial production","log_ip":"Log industrial production","energy_index":"Energy price index (HICP)",
-    "house_price_index":"House price index",
+    "house_price_index":"House / real estate price index",
     "estr":"€STR","dfr":"Deposit facility rate (DFR)","mro":"Main refinancing operations rate (MRO)",
     "aaa_1y":"EA AAA 1Y spot yield","aaa_10y":"EA AAA 10Y spot yield",
     "sovereign_1y":"Sovereign 1Y yield","sovereign_10y":"Sovereign 10Y yield",
@@ -510,13 +510,22 @@ us_labels={
     "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
     "cpi_level":"CPI level","inflation_rate":"CPI inflation","unemployment_rate":"Unemployment rate",
     "ip":"Industrial production","log_ip":"Log industrial production","energy_cpi":"Energy price index (CPI)",
-    "house_price_index":"House price index",
+    "house_price_index":"House / real estate price index",
     "fed_funds":"Effective federal funds rate","sofr":"SOFR",
     "treasury_1y":"US Treasury 1Y yield","treasury_10y":"US Treasury 10Y yield",
     "sp500":"S&P 500","djia":"Dow Jones Industrial Average",
 }
 labels=us_labels if geography=="United States" else eu_labels
-available_vars=(US_VARS if geography=="United States" else ([v for v in CANONICAL_VARS if v != "country_equity_index"] if geography=="Euro area" else CANONICAL_VARS))
+if geography == "United States":
+    available_vars = list(US_VARS)
+elif geography == "Euro area":
+    available_vars = [v for v in CANONICAL_VARS if v != "country_equity_index"]
+else:  # Euro-area countries
+    available_vars = list(CANONICAL_VARS)
+    # Keep country-level real-estate and energy indices explicitly available in the UI.
+    for _required_index in ("house_price_index", "energy_index", "country_equity_index", "eurostoxx50"):
+        if _required_index not in available_vars:
+            available_vars.append(_required_index)
 
 # Three compact research-oriented categories.
 # Nothing is pre-selected: users explicitly choose only the series they need.
@@ -554,7 +563,7 @@ selected_vars = []
 _group_help = {
     "Macro": "Activity, prices, production and labour-market indicators",
     "Rates & Money": "Policy, money-market and government-bond rates",
-    "Financial / Other Indexes": "Equities, residential property and energy-price indices",
+    "Financial / Other Indexes": "Equity, house / real-estate and energy price indices",
 }
 for _col, (_group_name, _group_vars) in zip(_group_cols, variable_groups.items()):
     _opts = [v for v in _group_vars if v in available_vars]
