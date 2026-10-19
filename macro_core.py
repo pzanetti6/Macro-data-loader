@@ -386,22 +386,57 @@ def _fetch_hicp_level(client: EurostatClient, geo: str, start_m: str, end_m: str
 
 
 def _fetch_house_price_index(client: EurostatClient, geo: str, start_q: str, end_q: str) -> pd.Series:
-    """Eurostat nominal House Price Index for EA aggregates and individual countries.
+    """Eurostat nominal House Price Index for EA aggregates and countries.
 
-    Eurostat rebased the current HPI dissemination to 2025=100 in 2026.  Query the
-    current base first, while retaining the older 2015/2010 bases as fallbacks so
-    historical or transitional Eurostat responses do not leave country sheets blank.
+    Eurostat occasionally changes/rebases UNIT positions in ``prc_hpi_q``.  Rather
+    than making the country download depend on one hard-coded UNIT code, request
+    the small country slice and select TOTAL purchases + an index unit locally.
+    This is robust to the 2010/2015/2025 reference-base transition.
     """
-    candidates = []
-    for unit in ("I25_Q", "I15_Q", "I10_Q"):
-        candidates.extend([
-            {"geo": geo, "freq": "Q", "purchase": "TOTAL", "unit": unit},
-            {"geo": geo, "purchase": "TOTAL", "unit": unit},
-        ])
-    df = client.first_working("prc_hpi_q", candidates, start_q, end_q)
+    # First try a minimally filtered country slice.  One country over the requested
+    # window is small (purchase x unit x quarter) and avoids brittle SDMX code guesses.
+    attempts = [
+        {"geo": geo, "freq": "Q"},
+        {"geo": geo},
+    ]
+    df = None
+    errors = []
+    for filt in attempts:
+        try:
+            x = client.query("prc_hpi_q", filt, start=start_q, end=end_q)
+            if not x.empty:
+                df = x
+                break
+        except Exception as exc:
+            errors.append(str(exc))
+    if df is None or df.empty:
+        detail = errors[-1] if errors else "No observations returned."
+        raise DataError(f"Could not retrieve prc_hpi_q for {geo}. Last error: {detail}")
+
+    # Total residential-property purchases.  Keep a defensive fallback in case a
+    # future Eurostat structure omits PURCHASE from an already-totalled view.
+    if "purchase" in df.columns:
+        total = df[df["purchase"].astype(str).str.upper() == "TOTAL"]
+        if not total.empty:
+            df = total
+
+    # Prefer the newest index base, then legacy index bases.  Do not accidentally
+    # pick quarterly/annual percentage-change units from the same dataset.
+    if "unit" in df.columns:
+        units = [str(u) for u in df["unit"].dropna().unique()]
+        preferred = ["I25_Q", "I15_Q", "I10_Q", "I25", "I15", "I10"]
+        chosen = next((u for u in preferred if u in units), None)
+        if chosen is None:
+            # Generic Eurostat index-unit fallback; rate units normally start RCH.
+            index_units = [u for u in units if u.upper().startswith("I")]
+            chosen = index_units[0] if index_units else None
+        if chosen is None:
+            raise DataError(f"House price index for {geo}: no index unit found in prc_hpi_q (units: {units}).")
+        df = df[df["unit"].astype(str) == chosen]
+
     q = _series_to_quarterly(_time_value(df))
     if q.dropna().empty:
-        raise DataError(f"House price index: Eurostat returned no observations for {geo}.")
+        raise DataError(f"House price index: Eurostat returned no numeric observations for {geo}.")
     return q
 
 

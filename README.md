@@ -135,3 +135,7 @@ The variable picker now has a dedicated **Prices & real estate** category.
 - **United States — Energy price index:** BLS Energy CPI (`CPIENGSL`, distributed through FRED).
 
 Frequency harmonisation for house prices is deliberately conservative: quarterly data are used directly for quarterly output, averaged across quarters for annual output, and repeated within each quarter for monthly output. The monthly representation therefore does not invent intra-quarter house-price movements.
+
+
+### v15 HPI country fix
+Country HPI retrieval now downloads the small Eurostat `prc_hpi_q` country slice and selects TOTAL purchases and the newest available index base locally, avoiding brittle hard-coded unit filters.
