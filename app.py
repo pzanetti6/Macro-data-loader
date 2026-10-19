@@ -11,9 +11,20 @@ from openpyxl.utils.datetime import to_excel
 import pandas as pd
 import streamlit as st
 
-from macro_core import (CANONICAL_VARS, US_VARS, COUNTRY_NAMES, REFERENCE_EQUITY_INDEX, EA19, DataError,
+from macro_core import (CANONICAL_VARS, US_VARS, COUNTRY_NAMES, EA19, DataError,
                         fetch_country_panel, fetch_macro_dataset, fetch_us_dataset)
 from excel_tools import create_workbook, update_workbook, workbook_sheet_names
+
+# User-facing reference names for national equity series. Kept local to the UI so
+# startup does not depend on a display-only constant exported by macro_core.
+REFERENCE_EQUITY_INDEX = {
+    "AT": "ATX", "BE": "BEL 20", "CY": "Cyprus General Index", "DE": "DAX",
+    "EE": "OMX Tallinn", "EL": "Athens General Composite", "ES": "IBEX 35",
+    "FI": "OMX Helsinki 25", "FR": "CAC 40", "IE": "ISEQ Overall",
+    "IT": "FTSE MIB", "LT": "OMX Vilnius", "LU": "LuxX", "LV": "OMX Riga",
+    "MT": "Malta Stock Exchange Index", "NL": "AEX", "PT": "PSI",
+    "SI": "SBI TOP", "SK": "SAX",
+}
 
 
 SHOCK_SHEET_BY_FREQ = {"M": "monthly_freq", "Q": "quarterly_freq", "A": "annual_freq"}
