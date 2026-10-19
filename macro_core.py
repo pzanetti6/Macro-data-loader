@@ -1064,6 +1064,58 @@ def _fred_series(series_id: str, start_year: int, end_year: int) -> pd.Series:
         return out
 
 
+def _fred_market_series(series_id: str, start_year: int, end_year: int, freq: str) -> pd.Series:
+    """Download a daily FRED market index already aggregated by FRED.
+
+    This avoids transferring thousands of daily observations to Streamlit Cloud.
+    FRED's graph endpoint supports lower-frequency aggregation; we request the
+    user's target frequency directly and use arithmetic averages, matching the
+    app's period-average convention.
+    """
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    fq = {"M": "Monthly", "Q": "Quarterly", "A": "Annual"}[freq]
+    params = {
+        "id": series_id,
+        "cosd": f"{start_year}-01-01",
+        "coed": f"{end_year}-12-31",
+        "fq": fq,
+        "fam": "avg",
+    }
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Macro-Data-Updater/1.0"})
+    transient = {429, 500, 502, 503, 504}
+    last_error = None
+    for attempt in range(4):
+        try:
+            r = session.get(url, params=params, timeout=(8, 30))
+            if r.status_code == 200:
+                df = pd.read_csv(io.StringIO(r.text))
+                if df.empty or series_id not in df.columns:
+                    raise DataError(f"FRED {series_id}: no observations returned.")
+                dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+                vals = pd.to_numeric(df[series_id], errors="coerce")
+                x = pd.Series(vals.values, index=dt).dropna()
+                x = x[~x.index.isna()].sort_index()
+                if x.empty:
+                    raise DataError(f"FRED {series_id}: no numeric observations returned.")
+                # The endpoint has already aggregated the daily observations.
+                if freq == "M":
+                    idx = x.index.to_period("M")
+                elif freq == "Q":
+                    idx = x.index.to_period("Q")
+                else:
+                    idx = x.index.to_period("Y")
+                return pd.Series(x.values, index=idx).groupby(level=0).last()
+            if r.status_code not in transient:
+                raise DataError(f"FRED {series_id} returned HTTP {r.status_code}.")
+            last_error = f"HTTP {r.status_code}"
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = str(exc)
+        if attempt < 3:
+            time.sleep(min(1.0 * (2 ** attempt), 8))
+    raise DataError(f"FRED {series_id}: market-data request failed after retries ({last_error}).")
+
+
 def _dated_to_period(s: pd.Series, freq: str, native: str) -> pd.Series:
     """Convert dated US series to requested M/Q/A frequency using period averages."""
     if native == "Q":
@@ -1215,13 +1267,12 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     # the ECB EURO STOXX period-average convention.
     for var, sid, label in [("sp500", "SP500", "S&P 500"), ("djia", "DJIA", "Dow Jones Industrial Average")]:
         if var in vars_set:
-            raw = _fred_series(sid, start_year, end_year)
-            s = _daily_market_to_target(raw, freq)
+            s = _fred_market_series(sid, start_year, end_year, freq)
             data[var] = s
             sources[var] = f"S&P Dow Jones Indices via FRED · {sid}"
             meta.append(FetchMeta(label, "S&P Dow Jones Indices via FRED", sid, "US", "D",
                                   str(s.dropna().index.max()) if not s.dropna().empty else None,
-                                  "Daily close aggregated by arithmetic mean within the requested period; FRED licensing may limit historical daily coverage."))
+                                  "FRED server-side arithmetic average of daily closes at the requested frequency; avoids downloading the full daily series. FRED licensing may limit historical coverage."))
 
     target=_period_range(freq,start_year,end_year)
     out=pd.DataFrame(index=target)
