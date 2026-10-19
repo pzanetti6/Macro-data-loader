@@ -1155,15 +1155,36 @@ def _dated_to_period(s: pd.Series, freq: str, native: str) -> pd.Series:
 
 
 
-# OECD/FRED country codes used by the harmonised national share-price series.
-# The app uses the monthly OECD Main Economic Indicators share-price index when
-# available. This is preferable to silently scraping branded exchange indices:
-# it is a documented, cross-country-comparable official statistical series.
+# Main national equity benchmarks used for euro-area country datasets.
+# Yahoo Finance symbols are used here because the previous OECD/FRED country
+# route was unreliable from Streamlit Cloud. EURO STOXX 50 remains on ECB.
+# Countries without a reliable Yahoo benchmark mapping fall back to the OECD
+# harmonised share-price series rather than silently substituting another country.
+_COUNTRY_EQUITY_YAHOO = {
+    "AT": ("^ATX", "ATX"),
+    "BE": ("^BFX", "BEL 20"),
+    "DE": ("^GDAXI", "DAX"),
+    "EL": ("^ATG", "Athens General Composite"),
+    "ES": ("^IBEX", "IBEX 35"),
+    "FI": ("^OMXH25", "OMX Helsinki 25"),
+    "FR": ("^FCHI", "CAC 40"),
+    "IE": ("^ISEQ", "ISEQ Overall"),
+    "IT": ("FTSEMIB.MI", "FTSE MIB"),
+    "NL": ("^AEX", "AEX"),
+    "PT": ("PSI20.LS", "PSI"),
+    "EE": ("^OMXT", "OMX Tallinn"),
+    "LV": ("^OMXR", "OMX Riga"),
+    "LT": ("^OMXV", "OMX Vilnius"),
+}
+
+# Fallback for countries for which Yahoo does not expose a stable national
+# benchmark symbol. This preserves coverage without making FRED the primary
+# route for the large-country indices.
 _OECD_EQUITY_CODE = {
-    "AT": "AT", "BE": "BE", "DE": "DE", "EL": "GR", "ES": "ES",
+    "AT": "AT", "BE": "BE", "CY": "CY", "DE": "DE", "EL": "GR", "ES": "ES",
     "FI": "FI", "FR": "FR", "IE": "IE", "IT": "IT", "LT": "LT",
-    "LU": "LU", "LV": "LV", "NL": "NL", "PT": "PT", "SI": "SI",
-    "SK": "SK",
+    "LU": "LU", "LV": "LV", "MT": "MT", "NL": "NL", "PT": "PT",
+    "SI": "SI", "SK": "SK", "EE": "EE",
 }
 
 def _daily_market_to_target(s: pd.Series, freq: str) -> pd.Series:
@@ -1189,22 +1210,37 @@ def _fetch_eurostoxx50(ecb: ECBClient, freq: str, start_year: int, end_year: int
     return s, f"RTD.{key}"
 
 def _fetch_country_equity_index(country: str, freq: str, start_year: int, end_year: int) -> tuple[pd.Series, str]:
-    """OECD national share-price index distributed through FRED.
+    """Fetch the country's main national equity benchmark.
 
-    Prefer the monthly series and aggregate it to Q/A. If the country has no OECD
-    monthly series, return an empty series rather than substituting a different
-    concept or failing the entire country workbook.
+    Primary route: Yahoo Finance monthly bars for the actual headline national
+    index (DAX, CAC 40, FTSE MIB, IBEX 35, AEX, etc.). This fixes the previous
+    country-equity bug caused by relying on OECD/FRED identifiers that were often
+    unavailable or slow from Streamlit Cloud. For smaller EA markets without a
+    stable Yahoo benchmark mapping, retain the OECD/FRED harmonised index as a
+    fallback. Missing data stay missing; no cross-country substitution is made.
     """
+    mapped = _COUNTRY_EQUITY_YAHOO.get(country)
+    if mapped:
+        symbol, name = mapped
+        try:
+            s = _yahoo_market_series(symbol, start_year, end_year, freq)
+            if not s.empty:
+                return s, f"Yahoo Finance {symbol} ({name})"
+        except Exception:
+            pass
+
     cc = _OECD_EQUITY_CODE.get(country)
-    if not cc:
-        return pd.Series(dtype=float), "OECD national share-price index unavailable"
-    sid = f"SPASTT01{cc}M661N"
-    try:
-        raw = _fred_series(sid, start_year, end_year)
-    except Exception:
-        return pd.Series(dtype=float), f"{sid} unavailable"
-    s = _dated_to_period(raw, freq, "M")
-    return s, sid
+    if cc:
+        sid = f"SPASTT01{cc}M661N"
+        try:
+            raw = _fred_series(sid, start_year, end_year)
+            s = _dated_to_period(raw, freq, "M")
+            if not s.empty:
+                return s, f"OECD via FRED {sid}"
+        except Exception:
+            pass
+
+    return pd.Series(dtype=float), "National equity benchmark unavailable"
 
 
 def fetch_us_dataset(freq: str, start_year: int, end_year: int,
