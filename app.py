@@ -531,7 +531,7 @@ else:
         "Financial markets": ["eurostoxx50", "country_equity_index"],
     }
 
-st.caption("Choose the series you want by category. All available series are selected by default; click a pill to toggle it.")
+st.caption("Choose the series you want by category. Nothing is selected by default; click a pill to add it.")
 _group_cols = st.columns(3)
 selected_vars = []
 _group_help = {
@@ -549,7 +549,7 @@ for _col, (_group_name, _group_vars) in zip(_group_cols, variable_groups.items()
                 _picked = st.pills(
                     f"{_group_name} series",
                     _opts,
-                    default=_opts,
+                    default=[],
                     selection_mode="multi",
                     format_func=lambda x: labels.get(x, x.replace("_", " ").title()),
                     key=f"vars_{geography}_{_group_name}",

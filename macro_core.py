@@ -999,26 +999,69 @@ def fetch_macro_dataset(
 
 
 def _fred_series(series_id: str, start_year: int, end_year: int) -> pd.Series:
-    """Download a public FRED series without requiring a user API key."""
+    """Download a public FRED series without an API key, with Streamlit-safe retries.
+
+    FRED occasionally responds slowly to cloud-hosted requests. Retry transient network
+    failures / 429 / 5xx responses with exponential backoff. If a long request still
+    fails, retry in 10-year chunks and combine the results.
+    """
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-    r = requests.get(
-        url,
-        params={"id": series_id, "cosd": f"{start_year}-01-01", "coed": f"{end_year}-12-31"},
-        timeout=45,
-        headers={"User-Agent": "Macro-Data-Updater/1.0"},
-    )
-    if r.status_code != 200:
-        raise DataError(f"FRED {series_id} returned HTTP {r.status_code}.")
-    df = pd.read_csv(io.StringIO(r.text))
-    if df.empty or series_id not in df.columns:
-        raise DataError(f"FRED {series_id}: no observations returned.")
-    dt = pd.to_datetime(df.iloc[:,0], errors="coerce")
-    vals = pd.to_numeric(df[series_id], errors="coerce")
-    s = pd.Series(vals.values, index=dt).dropna()
-    s = s[~s.index.isna()].sort_index()
-    if s.empty:
-        raise DataError(f"FRED {series_id}: no numeric observations returned.")
-    return s
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Macro-Data-Updater/1.0"})
+    transient = {429, 500, 502, 503, 504}
+
+    def one_request(y0: int, y1: int) -> pd.Series:
+        params = {"id": series_id, "cosd": f"{y0}-01-01", "coed": f"{y1}-12-31"}
+        last_error = None
+        for attempt in range(5):
+            try:
+                r = session.get(url, params=params, timeout=(10, 60))
+                if r.status_code == 200:
+                    df = pd.read_csv(io.StringIO(r.text))
+                    if df.empty or series_id not in df.columns:
+                        raise DataError(f"FRED {series_id}: no observations returned.")
+                    dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+                    vals = pd.to_numeric(df[series_id], errors="coerce")
+                    out = pd.Series(vals.values, index=dt).dropna()
+                    out = out[~out.index.isna()].sort_index()
+                    if out.empty:
+                        raise DataError(f"FRED {series_id}: no numeric observations returned.")
+                    return out
+                if r.status_code not in transient:
+                    raise DataError(f"FRED {series_id} returned HTTP {r.status_code}.")
+                last_error = f"HTTP {r.status_code}"
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else 1.5 * (2 ** attempt)
+                except (TypeError, ValueError):
+                    wait = 1.5 * (2 ** attempt)
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_error = str(exc)
+                wait = 1.5 * (2 ** attempt)
+            if attempt < 4:
+                time.sleep(min(wait, 20))
+        raise DataError(f"FRED {series_id}: request failed after retries ({last_error}).")
+
+    try:
+        return one_request(start_year, end_year)
+    except DataError as full_error:
+        # Long cloud requests are the most likely to time out. Split them without
+        # changing the requested sample or silently dropping observations.
+        if end_year - start_year < 10:
+            raise full_error
+        pieces = []
+        errors = []
+        for y0 in range(start_year, end_year + 1, 10):
+            y1 = min(y0 + 9, end_year)
+            try:
+                pieces.append(one_request(y0, y1))
+            except DataError as exc:
+                errors.append(f"{y0}-{y1}: {exc}")
+        if not pieces:
+            raise DataError(f"FRED {series_id}: full and chunked downloads failed. " + "; ".join(errors[:3]))
+        out = pd.concat(pieces)
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        return out
 
 
 def _dated_to_period(s: pd.Series, freq: str, native: str) -> pd.Series:
@@ -1114,11 +1157,20 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
                               str(s.dropna().index.max()) if not s.dropna().empty else None, note))
         return s
 
-    # Monthly indicator is useful both as output and for Chow-Lin GDP.
-    ip_raw=_fred_series("INDPRO", start_year-1, end_year)
-    ip_m=pd.Series(ip_raw.values,index=ip_raw.index.to_period("M")).groupby(level=0).mean()
+    # Download INDPRO only when the user actually selected IP/log IP, or when
+    # monthly GDP specifically needs it as the Chow-Lin indicator. This prevents
+    # an equity-only request from making an unnecessary FRED call.
+    need_gdp = any(v in vars_set for v in ("real_gdp","real_gdp_growth","log_real_gdp"))
+    need_ip = bool({"ip", "log_ip"} & vars_set) or (
+        need_gdp and freq == "M" and monthly_gdp_method == "Chow-Lin (industrial production)"
+    )
+    ip_raw = None
+    ip_m = None
+    if need_ip:
+        ip_raw = _fred_series("INDPRO", start_year-1, end_year)
+        ip_m = pd.Series(ip_raw.values,index=ip_raw.index.to_period("M")).groupby(level=0).mean()
 
-    if any(v in vars_set for v in ("real_gdp","real_gdp_growth","log_real_gdp")):
+    if need_gdp:
         graw=_fred_series("GDPC1", start_year-1, end_year)
         gq=pd.Series(graw.values,index=graw.index.to_period("Q")).groupby(level=0).last()
         g=_gdp_to_frequency(gq, freq, monthly_gdp_method, ip_m)
@@ -1147,10 +1199,10 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
         meta.append(FetchMeta("CPI","BLS","CPIAUCSL","US","M",str(c.dropna().index.max()),"Seasonally adjusted CPI-U."))
 
     if "unemployment_rate" in vars_set: add("unemployment_rate","UNRATE","BLS","M","Seasonally adjusted unemployment rate.")
-    if "ip" in vars_set:
+    if "ip" in vars_set and ip_raw is not None:
         data["ip"]=_dated_to_period(ip_raw,freq,"M"); sources["ip"]="Federal Reserve via FRED · INDPRO"
         meta.append(FetchMeta("Industrial production","Federal Reserve","INDPRO","US","M",str(data["ip"].dropna().index.max()),"Industrial Production Index."))
-    if "log_ip" in vars_set:
+    if "log_ip" in vars_set and ip_raw is not None:
         data["log_ip"]=np.log(_dated_to_period(ip_raw,freq,"M")); sources["log_ip"]="Derived from Federal Reserve INDPRO"
     if "energy_cpi" in vars_set: add("energy_cpi","CPIENGSL","BLS","M","CPI energy index, seasonally adjusted.")
     if "fed_funds" in vars_set: add("fed_funds","FEDFUNDS","Federal Reserve","M","Effective federal funds rate.")
