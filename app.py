@@ -504,12 +504,62 @@ us_labels={
 }
 labels=us_labels if geography=="United States" else eu_labels
 available_vars=(US_VARS if geography=="United States" else ([v for v in CANONICAL_VARS if v != "country_equity_index"] if geography=="Euro area" else CANONICAL_VARS))
-selected_vars=st.multiselect(
-    "Series to include",
-    available_vars,
-    default=available_vars,
-    format_func=lambda x: labels.get(x,x.replace("_"," ").title()),
-)
+
+# Group the variable picker into research-friendly blocks instead of one long list.
+# Pills remain fully clickable and allow any combination within/across categories.
+if geography == "United States":
+    variable_groups = {
+        "Macro economy": [
+            "real_gdp", "real_gdp_growth", "log_real_gdp", "cpi_level",
+            "inflation_rate", "unemployment_rate", "ip", "log_ip", "energy_cpi",
+        ],
+        "Rates & monetary policy": [
+            "fed_funds", "sofr", "treasury_1y", "treasury_10y",
+        ],
+        "Financial markets": ["sp500", "djia"],
+    }
+else:
+    variable_groups = {
+        "Macro economy": [
+            "real_gdp", "real_gdp_growth", "log_real_gdp", "hicp_level",
+            "hicp_rate", "unemployment_rate", "ip", "log_ip", "energy_index",
+        ],
+        "Rates & monetary policy": [
+            "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
+            "sovereign_1y", "sovereign_10y",
+        ],
+        "Financial markets": ["eurostoxx50", "country_equity_index"],
+    }
+
+st.caption("Choose the series you want by category. All available series are selected by default; click a pill to toggle it.")
+_group_cols = st.columns(3)
+selected_vars = []
+_group_help = {
+    "Macro economy": "Activity, prices and labour-market indicators",
+    "Rates & monetary policy": "Policy, money-market and government-bond rates",
+    "Financial markets": "Broad equity-market indices",
+}
+for _col, (_group_name, _group_vars) in zip(_group_cols, variable_groups.items()):
+    _opts = [v for v in _group_vars if v in available_vars]
+    with _col:
+        with st.container(border=True):
+            st.markdown(f"**{_group_name}**")
+            st.caption(_group_help[_group_name])
+            if _opts:
+                _picked = st.pills(
+                    f"{_group_name} series",
+                    _opts,
+                    default=_opts,
+                    selection_mode="multi",
+                    format_func=lambda x: labels.get(x, x.replace("_", " ").title()),
+                    key=f"vars_{geography}_{_group_name}",
+                    label_visibility="collapsed",
+                )
+                selected_vars.extend(_picked or [])
+            else:
+                st.caption("No series available for this dataset.")
+
+st.caption(f"{len(selected_vars)} of {len(available_vars)} available series selected.")
 
 monthly_gdp_method="Chow-Lin (industrial production)"
 if freq=="M" and any(v in selected_vars for v in ("real_gdp","real_gdp_growth","log_real_gdp")):
