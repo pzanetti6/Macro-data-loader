@@ -386,13 +386,23 @@ def _fetch_hicp_level(client: EurostatClient, geo: str, start_m: str, end_m: str
 
 
 def _fetch_house_price_index(client: EurostatClient, geo: str, start_q: str, end_q: str) -> pd.Series:
-    """Eurostat nominal House Price Index, total purchases, 2015=100, quarterly."""
-    candidates = [
-        {"geo": geo, "freq": "Q", "purchase": "TOTAL", "unit": "I15_Q"},
-        {"geo": geo, "purchase": "TOTAL", "unit": "I15_Q"},
-    ]
+    """Eurostat nominal House Price Index for EA aggregates and individual countries.
+
+    Eurostat rebased the current HPI dissemination to 2025=100 in 2026.  Query the
+    current base first, while retaining the older 2015/2010 bases as fallbacks so
+    historical or transitional Eurostat responses do not leave country sheets blank.
+    """
+    candidates = []
+    for unit in ("I25_Q", "I15_Q", "I10_Q"):
+        candidates.extend([
+            {"geo": geo, "freq": "Q", "purchase": "TOTAL", "unit": unit},
+            {"geo": geo, "purchase": "TOTAL", "unit": unit},
+        ])
     df = client.first_working("prc_hpi_q", candidates, start_q, end_q)
-    return _series_to_quarterly(_time_value(df))
+    q = _series_to_quarterly(_time_value(df))
+    if q.dropna().empty:
+        raise DataError(f"House price index: Eurostat returned no observations for {geo}.")
+    return q
 
 
 def _house_price_to_frequency(q: pd.Series, freq: str) -> pd.Series:
@@ -883,8 +893,8 @@ def fetch_macro_dataset(
         hpi = _house_price_to_frequency(hpi_q, freq)
         data["house_price_index"] = hpi
         sources["house_price_index"] = "Eurostat · prc_hpi_q"
-        add_meta("House price index", "Eurostat", "prc_hpi_q (TOTAL, I15_Q)", "Q", hpi_q,
-                 "Residential properties purchased by households, 2015=100. Monthly output repeats each quarterly value within its three months; annual output averages quarters.")
+        add_meta("House price index", "Eurostat", "prc_hpi_q (TOTAL; current base 2025=100, legacy-base fallback)", "Q", hpi_q,
+                 "Residential properties purchased by households. Current Eurostat HPI base is 2025=100; legacy index bases are accepted as fallbacks. Monthly output repeats each quarterly value within its three months; annual output averages quarters.")
 
     # Unemployment
     if "unemployment_rate" in vars_set:
