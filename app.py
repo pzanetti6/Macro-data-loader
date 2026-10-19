@@ -491,6 +491,8 @@ eu_labels={
     "estr":"€STR","dfr":"Deposit facility rate (DFR)","mro":"Main refinancing operations rate (MRO)",
     "aaa_1y":"EA AAA 1Y spot yield","aaa_10y":"EA AAA 10Y spot yield",
     "sovereign_1y":"Sovereign 1Y yield","sovereign_10y":"Sovereign 10Y yield",
+    "eurostoxx50":"EURO STOXX 50 equity index",
+    "country_equity_index":"National equity / share-price index",
 }
 us_labels={
     "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
@@ -498,9 +500,10 @@ us_labels={
     "ip":"Industrial production","log_ip":"Log industrial production","energy_cpi":"Energy CPI",
     "fed_funds":"Effective federal funds rate","sofr":"SOFR",
     "treasury_1y":"US Treasury 1Y yield","treasury_10y":"US Treasury 10Y yield",
+    "sp500":"S&P 500","djia":"Dow Jones Industrial Average",
 }
 labels=us_labels if geography=="United States" else eu_labels
-available_vars=US_VARS if geography=="United States" else CANONICAL_VARS
+available_vars=(US_VARS if geography=="United States" else ([v for v in CANONICAL_VARS if v != "country_equity_index"] if geography=="Euro area" else CANONICAL_VARS))
 selected_vars=st.multiselect(
     "Series to include",
     available_vars,
@@ -528,7 +531,7 @@ if geography=="Euro-area countries":
 if geography=="United States":
     st.caption("US sources: BEA, BLS, Federal Reserve/FRBNY and U.S. Treasury series distributed through FRED. The workbook records the source and series ID beside each variable.")
 else:
-    st.caption("European sources: ECB Data Portal and Eurostat. The app keeps source provenance beside each series.")
+    st.caption("European sources: ECB Data Portal, Eurostat, and OECD national share-price indices distributed through FRED. The app keeps source provenance beside each series.")
     st.caption("EA AAA yields are common fitted AAA curves. Sovereign 10Y is the broad EA convergence yield for EA output and the selected country's own convergence yield in country output.")
 
 
@@ -703,6 +706,10 @@ if run:
                 "sofr": "Direct SOFR; observations are averaged within the requested period.",
                 "treasury_1y": "Direct US Treasury/Federal Reserve constant-maturity 1Y yield; period-averaged where needed.",
                 "treasury_10y": "Direct US Treasury/Federal Reserve constant-maturity 10Y yield; period-averaged where needed.",
+                "eurostoxx50": "ECB EURO STOXX 50 historical close, average of observations through period; monthly observations are averaged to quarterly/annual output.",
+                "country_equity_index": "OECD Main Economic Indicators national share-price index via FRED; monthly observations averaged to the requested lower frequency. Blank where no comparable OECD series exists.",
+                "sp500": "S&P 500 daily close via FRED; arithmetic mean of daily closes within the requested month/quarter/year.",
+                "djia": "Dow Jones Industrial Average daily close via FRED; arithmetic mean of daily closes within the requested month/quarter/year.",
             }
             # Meta variable names are not perfectly uniform, so match normalized labels.
             def _how(row):
@@ -818,6 +825,8 @@ with st.expander("Variable definitions, construction and sources"):
 - **€STR** — official €STR observations, averaged to the requested frequency where needed.
 - **EA AAA 1Y / 10Y** — ECB fitted AAA government-bond spot curves; daily observations are period-averaged. Their official history starts later than the core macro data.
 - **Sovereign 10Y** — ECB convergence-purpose government yield: broad EA aggregate for EA output and the individual country's yield for country output. It is not treated as equivalent to the AAA curve.
+- **EURO STOXX 50** — ECB historical-close equity index, using the ECB period-average convention. It can be included in the EA aggregate and in every country workbook as the common euro-area market benchmark.
+- **National equity / share-price index** — OECD Main Economic Indicators national share-price index distributed through FRED, used for country output where available. Monthly observations are averaged to quarterly/annual frequency; unavailable countries remain blank rather than receiving a substituted index.
 
 **United States**
 - **Real GDP** — BEA real GDP (`GDPC1`) distributed through FRED. Monthly values are temporally disaggregated from the quarterly benchmark using the selected method.
@@ -829,5 +838,6 @@ with st.expander("Variable definitions, construction and sources"):
 - **Federal funds rate** — effective federal funds rate.
 - **SOFR** — Federal Reserve Bank of New York SOFR.
 - **Treasury 1Y / 10Y** — US Treasury/Federal Reserve constant-maturity yields (`GS1`, `GS10`).
+- **S&P 500 / Dow Jones Industrial Average** — daily closing price indices (`SP500`, `DJIA`) distributed through FRED and averaged within the selected month/quarter/year.
 
 """)

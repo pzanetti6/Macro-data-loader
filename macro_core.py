@@ -33,6 +33,7 @@ CANONICAL_VARS = [
     "unemployment_rate", "ip", "log_ip", "energy_index",
     "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
     "sovereign_1y", "sovereign_10y",
+    "eurostoxx50", "country_equity_index",
 ]
 
 US_VARS = [
@@ -40,6 +41,7 @@ US_VARS = [
     "cpi_level", "inflation_rate", "unemployment_rate",
     "ip", "log_ip", "energy_cpi",
     "fed_funds", "sofr", "treasury_1y", "treasury_10y",
+    "sp500", "djia",
 ]
 
 SOURCE_URLS = {
@@ -964,6 +966,27 @@ def fetch_macro_dataset(
         except Exception as exc:
             raise DataError(f"{v}: could not retrieve ECB series {flow}.{key}: {exc}")
 
+    # Equity indices. EURO STOXX 50 is common to the euro-area/country outputs.
+    # Individual-country output additionally uses the OECD harmonised national
+    # share-price index (via FRED) when available.
+    if "eurostoxx50" in vars_set:
+        try:
+            sx5e, sx5e_sid = _fetch_eurostoxx50(ecb, freq, start_year, end_year)
+            data["eurostoxx50"] = sx5e
+            sources["eurostoxx50"] = "ECB"
+            add_meta("EURO STOXX 50", "ECB", sx5e_sid, "M", sx5e,
+                     "Historical close; average of observations through period. Quarterly/annual output is averaged from monthly observations.")
+        except Exception as exc:
+            raise DataError(f"eurostoxx50: could not retrieve ECB EURO STOXX 50 series: {exc}")
+
+    if "country_equity_index" in vars_set and not requested_ea:
+        eq, eq_sid = _fetch_country_equity_index(actual_geo, freq, start_year, end_year)
+        data["country_equity_index"] = eq
+        sources["country_equity_index"] = ("OECD via FRED" if not eq.empty else "Unavailable")
+        add_meta("Country equity index", "OECD via FRED" if not eq.empty else "Unavailable",
+                 eq_sid, "M", eq,
+                 "OECD Main Economic Indicators national share-price index (2015=100 where applicable); monthly observations averaged to the requested lower frequency. Left blank when no comparable OECD series exists.")
+
     target = _period_range(freq, start_year, end_year)
     out = pd.DataFrame(index=target)
     # Put provenance immediately after each variable, as requested.
@@ -1013,6 +1036,59 @@ def _dated_to_period(s: pd.Series, freq: str, native: str) -> pd.Series:
     if freq == "Q":
         return m.groupby(m.index.asfreq("Q")).mean()
     return m.groupby(m.index.asfreq("Y")).mean()
+
+
+
+# OECD/FRED country codes used by the harmonised national share-price series.
+# The app uses the monthly OECD Main Economic Indicators share-price index when
+# available. This is preferable to silently scraping branded exchange indices:
+# it is a documented, cross-country-comparable official statistical series.
+_OECD_EQUITY_CODE = {
+    "AT": "AT", "BE": "BE", "DE": "DE", "EL": "GR", "ES": "ES",
+    "FI": "FI", "FR": "FR", "IE": "IE", "IT": "IT", "LT": "LT",
+    "LU": "LU", "LV": "LV", "NL": "NL", "PT": "PT", "SI": "SI",
+    "SK": "SK",
+}
+
+def _daily_market_to_target(s: pd.Series, freq: str) -> pd.Series:
+    """Aggregate daily market closes to the requested frequency by arithmetic mean.
+
+    This matches the ECB EURO STOXX convention used here (average of observations
+    through the period), so US and European equity series are frequency-comparable.
+    """
+    x = pd.Series(pd.to_numeric(s.values, errors="coerce"), index=pd.to_datetime(s.index, errors="coerce")).dropna()
+    x = x[~x.index.isna()].sort_index()
+    if freq == "M":
+        return x.groupby(x.index.to_period("M")).mean()
+    if freq == "Q":
+        return x.groupby(x.index.to_period("Q")).mean()
+    if freq == "A":
+        return x.groupby(x.index.to_period("Y")).mean()
+    raise ValueError(freq)
+
+def _fetch_eurostoxx50(ecb: ECBClient, freq: str, start_year: int, end_year: int) -> tuple[pd.Series, str]:
+    """EURO STOXX 50 from the ECB Real Time Database, monthly period-average close."""
+    key = "M.S0.N.C_DJE50.X"
+    s = _ecb_monthly_to_target(ecb, "RTD", key, freq, start_year, end_year)
+    return s, f"RTD.{key}"
+
+def _fetch_country_equity_index(country: str, freq: str, start_year: int, end_year: int) -> tuple[pd.Series, str]:
+    """OECD national share-price index distributed through FRED.
+
+    Prefer the monthly series and aggregate it to Q/A. If the country has no OECD
+    monthly series, return an empty series rather than substituting a different
+    concept or failing the entire country workbook.
+    """
+    cc = _OECD_EQUITY_CODE.get(country)
+    if not cc:
+        return pd.Series(dtype=float), "OECD national share-price index unavailable"
+    sid = f"SPASTT01{cc}M661N"
+    try:
+        raw = _fred_series(sid, start_year, end_year)
+    except Exception:
+        return pd.Series(dtype=float), f"{sid} unavailable"
+    s = _dated_to_period(raw, freq, "M")
+    return s, sid
 
 
 def fetch_us_dataset(freq: str, start_year: int, end_year: int,
@@ -1081,6 +1157,19 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     if "sofr" in vars_set: add("sofr","SOFR","Federal Reserve Bank of New York","M","Secured Overnight Financing Rate.")
     if "treasury_1y" in vars_set: add("treasury_1y","GS1","U.S. Treasury / Federal Reserve","M","1-year Treasury constant maturity rate.")
     if "treasury_10y" in vars_set: add("treasury_10y","GS10","U.S. Treasury / Federal Reserve","M","10-year Treasury constant maturity rate.")
+
+    # US equity benchmarks: daily closing price indices distributed through FRED.
+    # Aggregate by arithmetic mean within month/quarter/year for consistency with
+    # the ECB EURO STOXX period-average convention.
+    for var, sid, label in [("sp500", "SP500", "S&P 500"), ("djia", "DJIA", "Dow Jones Industrial Average")]:
+        if var in vars_set:
+            raw = _fred_series(sid, start_year, end_year)
+            s = _daily_market_to_target(raw, freq)
+            data[var] = s
+            sources[var] = f"S&P Dow Jones Indices via FRED · {sid}"
+            meta.append(FetchMeta(label, "S&P Dow Jones Indices via FRED", sid, "US", "D",
+                                  str(s.dropna().index.max()) if not s.dropna().empty else None,
+                                  "Daily close aggregated by arithmetic mean within the requested period; FRED licensing may limit historical daily coverage."))
 
     target=_period_range(freq,start_year,end_year)
     out=pd.DataFrame(index=target)

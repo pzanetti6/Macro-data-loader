@@ -52,6 +52,7 @@ Macro Data Loader/
 - Retrieves the core macro block from Eurostat and equivalent ECB series where mapped.
 - Chooses among equivalent sources using the app's longest/freshest-history logic.
 - Supports optional ECB policy rates, money-market rates and yield series.
+- Adds equity benchmarks: EURO STOXX 50, harmonised OECD national share-price indices for country output, and S&P 500 / Dow Jones for US output; all are aligned to the selected M/Q/A frequency.
 - Provides plotting and diagnostics before Excel export.
 - Keeps the latest successful workbook in Streamlit session state so it remains downloadable after UI reruns.
 
