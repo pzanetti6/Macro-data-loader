@@ -22,6 +22,8 @@ ALIASES = {
     "ip": ["ip", "ea_ip", "industrial_production"],
     "log_ip": ["log_ip", "ea_log_ip"],
     "energy_index": ["energy_index", "ea_energy_index", "energy"],
+    "energy_cpi": ["energy_cpi", "us_energy_cpi"],
+    "house_price_index": ["house_price_index", "house_prices", "hpi", "residential_property_price_index"],
     "eurostoxx50": ["eurostoxx50", "euro_stoxx_50", "stoxx50", "sx5e"],
     "country_equity_index": ["country_equity_index", "equity_index", "share_price_index"],
     "sp500": ["sp500", "s&p500", "s_p_500"],

@@ -11,7 +11,7 @@ from openpyxl.utils.datetime import to_excel
 import pandas as pd
 import streamlit as st
 
-from macro_core import (CANONICAL_VARS, US_VARS, COUNTRY_NAMES, EA19, DataError,
+from macro_core import (CANONICAL_VARS, US_VARS, COUNTRY_NAMES, REFERENCE_EQUITY_INDEX, EA19, DataError,
                         fetch_country_panel, fetch_macro_dataset, fetch_us_dataset)
 from excel_tools import create_workbook, update_workbook, workbook_sheet_names
 
@@ -487,17 +487,19 @@ st.subheader("2 · Variables")
 eu_labels={
     "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
     "hicp_level":"HICP level","hicp_rate":"HICP inflation","unemployment_rate":"Unemployment rate",
-    "ip":"Industrial production","log_ip":"Log industrial production","energy_index":"Energy HICP index",
+    "ip":"Industrial production","log_ip":"Log industrial production","energy_index":"Energy price index (HICP)",
+    "house_price_index":"House price index",
     "estr":"€STR","dfr":"Deposit facility rate (DFR)","mro":"Main refinancing operations rate (MRO)",
     "aaa_1y":"EA AAA 1Y spot yield","aaa_10y":"EA AAA 10Y spot yield",
     "sovereign_1y":"Sovereign 1Y yield","sovereign_10y":"Sovereign 10Y yield",
     "eurostoxx50":"EURO STOXX 50 equity index",
-    "country_equity_index":"National equity / share-price index",
+    "country_equity_index":"National reference equity index",
 }
 us_labels={
     "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
     "cpi_level":"CPI level","inflation_rate":"CPI inflation","unemployment_rate":"Unemployment rate",
-    "ip":"Industrial production","log_ip":"Log industrial production","energy_cpi":"Energy CPI",
+    "ip":"Industrial production","log_ip":"Log industrial production","energy_cpi":"Energy price index (CPI)",
+    "house_price_index":"House price index",
     "fed_funds":"Effective federal funds rate","sofr":"SOFR",
     "treasury_1y":"US Treasury 1Y yield","treasury_10y":"US Treasury 10Y yield",
     "sp500":"S&P 500","djia":"Dow Jones Industrial Average",
@@ -505,39 +507,43 @@ us_labels={
 labels=us_labels if geography=="United States" else eu_labels
 available_vars=(US_VARS if geography=="United States" else ([v for v in CANONICAL_VARS if v != "country_equity_index"] if geography=="Euro area" else CANONICAL_VARS))
 
-# Group the variable picker into research-friendly blocks instead of one long list.
-# Pills remain fully clickable and allow any combination within/across categories.
+# Three compact research-oriented categories.
+# Nothing is pre-selected: users explicitly choose only the series they need.
 if geography == "United States":
     variable_groups = {
-        "Macro economy": [
+        "Macro": [
             "real_gdp", "real_gdp_growth", "log_real_gdp", "cpi_level",
-            "inflation_rate", "unemployment_rate", "ip", "log_ip", "energy_cpi",
+            "inflation_rate", "unemployment_rate", "ip", "log_ip",
         ],
-        "Rates & monetary policy": [
+        "Rates & Money": [
             "fed_funds", "sofr", "treasury_1y", "treasury_10y",
         ],
-        "Financial markets": ["sp500", "djia"],
+        "Financial / Other Indexes": [
+            "sp500", "djia", "house_price_index", "energy_cpi",
+        ],
     }
 else:
     variable_groups = {
-        "Macro economy": [
+        "Macro": [
             "real_gdp", "real_gdp_growth", "log_real_gdp", "hicp_level",
-            "hicp_rate", "unemployment_rate", "ip", "log_ip", "energy_index",
+            "hicp_rate", "unemployment_rate", "ip", "log_ip",
         ],
-        "Rates & monetary policy": [
+        "Rates & Money": [
             "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
             "sovereign_1y", "sovereign_10y",
         ],
-        "Financial markets": ["eurostoxx50", "country_equity_index"],
+        "Financial / Other Indexes": [
+            "eurostoxx50", "country_equity_index", "house_price_index", "energy_index",
+        ],
     }
 
 st.caption("Choose the series you want by category. Nothing is selected by default; click a pill to add it.")
 _group_cols = st.columns(3)
 selected_vars = []
 _group_help = {
-    "Macro economy": "Activity, prices and labour-market indicators",
-    "Rates & monetary policy": "Policy, money-market and government-bond rates",
-    "Financial markets": "Broad equity-market indices",
+    "Macro": "Activity, prices, production and labour-market indicators",
+    "Rates & Money": "Policy, money-market and government-bond rates",
+    "Financial / Other Indexes": "Equities, residential property and energy-price indices",
 }
 for _col, (_group_name, _group_vars) in zip(_group_cols, variable_groups.items()):
     _opts = [v for v in _group_vars if v in available_vars]
@@ -581,7 +587,7 @@ if geography=="Euro-area countries":
 if geography=="United States":
     st.caption("US sources: BEA, BLS, Federal Reserve/FRBNY and U.S. Treasury series distributed through FRED. The workbook records the source and series ID beside each variable.")
 else:
-    st.caption("European sources: ECB Data Portal, Eurostat, and OECD national share-price indices distributed through FRED. The app keeps source provenance beside each series.")
+    st.caption("European sources: ECB Data Portal, Eurostat, and OECD Financial Market national share-price indices via the direct OECD SDMX API. The app keeps source provenance beside each series.")
     st.caption("EA AAA yields are common fitted AAA curves. Sovereign 10Y is the broad EA convergence yield for EA output and the selected country's own convergence yield in country output.")
 
 
@@ -689,7 +695,20 @@ if run:
         datasets = _canonicalize_dataset_dates(datasets, freq)
 
         if action == "Create a new workbook":
-            out = create_workbook(datasets, freq, panel_format=panel_format)
+            # In country workbooks, show the familiar national reference-index name
+            # directly (DAX, CAC 40, FTSE MIB, etc.) instead of the generic
+            # country_equity_index header. Internal data remain canonical for plots.
+            workbook_datasets = datasets
+            if geography == "Euro-area countries" and "country_equity_index" in selected_vars:
+                workbook_datasets = {}
+                for _geo, _df in datasets.items():
+                    _x = _df.copy()
+                    _idx = REFERENCE_EQUITY_INDEX.get(_geo, "National equity index")
+                    _rename = {"country_equity_index": _idx}
+                    if "country_equity_index_source" in _x.columns:
+                        _rename["country_equity_index_source"] = f"{_idx}_source"
+                    workbook_datasets[_geo] = _x.rename(columns=_rename)
+            out = create_workbook(workbook_datasets, freq, panel_format=panel_format)
             _slug = "ea" if geography == "Euro area" else ("us" if geography == "United States" else "countries")
             filename = f"macro_{_slug}_{freq_label.lower()}.xlsx"
             summary = {"updated_cells": 0, "added_rows": sum(len(x) for x in datasets.values())}
@@ -757,7 +776,7 @@ if run:
                 "treasury_1y": "Direct US Treasury/Federal Reserve constant-maturity 1Y yield; period-averaged where needed.",
                 "treasury_10y": "Direct US Treasury/Federal Reserve constant-maturity 10Y yield; period-averaged where needed.",
                 "eurostoxx50": "ECB EURO STOXX 50 historical close, average of observations through period; monthly observations are averaged to quarterly/annual output.",
-                "country_equity_index": "OECD Main Economic Indicators national share-price index via FRED; monthly observations averaged to the requested lower frequency. Blank where no comparable OECD series exists.",
+                "country_equity_index": "OECD Financial Market harmonised national share-price series via the direct OECD SDMX API. Country workbooks display the familiar national reference-index name (for example DAX, CAC 40 or FTSE MIB) instead of a generic column label.",
                 "sp500": "S&P 500 daily close via FRED; arithmetic mean of daily closes within the requested month/quarter/year.",
                 "djia": "Dow Jones Industrial Average daily close via FRED; arithmetic mean of daily closes within the requested month/quarter/year.",
             }
@@ -876,7 +895,7 @@ with st.expander("Variable definitions, construction and sources"):
 - **EA AAA 1Y / 10Y** — ECB fitted AAA government-bond spot curves; daily observations are period-averaged. Their official history starts later than the core macro data.
 - **Sovereign 10Y** — ECB convergence-purpose government yield: broad EA aggregate for EA output and the individual country's yield for country output. It is not treated as equivalent to the AAA curve.
 - **EURO STOXX 50** — ECB historical-close equity index, using the ECB period-average convention. It can be included in the EA aggregate and in every country workbook as the common euro-area market benchmark.
-- **National equity / share-price index** — OECD Main Economic Indicators national share-price index distributed through FRED, used for country output where available. Monthly observations are averaged to quarterly/annual frequency; unavailable countries remain blank rather than receiving a substituted index.
+- **National reference equity index** — OECD Financial Market harmonised national share-price series retrieved directly through the OECD SDMX API. Country workbooks use the familiar reference-index name (for example DAX, CAC 40 or FTSE MIB) as the column header. Monthly observations are averaged to quarterly/annual frequency.
 
 **United States**
 - **Real GDP** — BEA real GDP (`GDPC1`) distributed through FRED. Monthly values are temporally disaggregated from the quarterly benchmark using the selected method.

@@ -124,3 +124,14 @@ This public edition focuses on macroeconomic data retrieval, harmonisation, diag
 The application logic is shared across operating systems. Keep OS-specific behaviour in the launcher files rather than adding Windows/macOS branches to `app.py`, `macro_core.py`, or `excel_tools.py` unless genuinely necessary.
 
 When releasing a new version, distribute a fresh ZIP **without** `.venv`, `.conda-python311`, `__pycache__`, `.DS_Store`, generated Excel files, or local logs.
+
+## v10 — house prices and energy prices
+
+The variable picker now has a dedicated **Prices & real estate** category.
+
+- **EA aggregate and EA countries — House price index:** Eurostat `prc_hpi_q`, total residential-property purchases, index 2015=100, native quarterly frequency.
+- **United States — House price index:** FHFA All-Transactions House Price Index (`USSTHPI`, distributed through FRED), native quarterly frequency.
+- **EA aggregate and EA countries — Energy price index:** Eurostat HICP energy aggregate (`NRG`). The loader now tries the current `prc_hicp_minr` ECOICOP v2 table first, with a legacy-table fallback.
+- **United States — Energy price index:** BLS Energy CPI (`CPIENGSL`, distributed through FRED).
+
+Frequency harmonisation for house prices is deliberately conservative: quarterly data are used directly for quarterly output, averaged across quarters for annual output, and repeated within each quarter for monthly output. The monthly representation therefore does not invent intra-quarter house-price movements.

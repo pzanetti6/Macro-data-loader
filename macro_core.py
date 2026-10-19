@@ -23,6 +23,31 @@ COUNTRY_NAMES = {
     "NL": "Netherlands", "PT": "Portugal", "SI": "Slovenia", "SK": "Slovakia",
 }
 
+# Familiar headline/reference equity-index names used for display and workbook headers.
+# Data retrieval remains the harmonised OECD national share-price series; these names make
+# country outputs immediately recognisable to users.
+REFERENCE_EQUITY_INDEX = {
+    "AT": "ATX",
+    "BE": "BEL 20",
+    "CY": "Cyprus General Index",
+    "DE": "DAX",
+    "EE": "OMX Tallinn",
+    "EL": "Athens General Composite",
+    "ES": "IBEX 35",
+    "FI": "OMX Helsinki 25",
+    "FR": "CAC 40",
+    "IE": "ISEQ Overall",
+    "IT": "FTSE MIB",
+    "LT": "OMX Vilnius",
+    "LU": "LuxX",
+    "LV": "OMX Riga",
+    "MT": "MSE Equity Price Index",
+    "NL": "AEX",
+    "PT": "PSI",
+    "SI": "SBITOP",
+    "SK": "SAX",
+}
+
 # Euro area aggregate codes have changed as membership expanded. EA20 is used as the aggregate
 # default for historical consistency with most recent Eurostat dissemination. Country mode avoids
 # this composition issue entirely.
@@ -30,7 +55,7 @@ EA_GEO_CANDIDATES = ["EA21", "EA20", "EA19"]
 
 CANONICAL_VARS = [
     "real_gdp", "real_gdp_growth", "log_real_gdp", "hicp_rate", "hicp_level",
-    "unemployment_rate", "ip", "log_ip", "energy_index",
+    "unemployment_rate", "ip", "log_ip", "energy_index", "house_price_index",
     "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
     "sovereign_1y", "sovereign_10y",
     "eurostoxx50", "country_equity_index",
@@ -39,7 +64,7 @@ CANONICAL_VARS = [
 US_VARS = [
     "real_gdp", "real_gdp_growth", "log_real_gdp",
     "cpi_level", "inflation_rate", "unemployment_rate",
-    "ip", "log_ip", "energy_cpi",
+    "ip", "log_ip", "energy_cpi", "house_price_index",
     "fed_funds", "sofr", "treasury_1y", "treasury_10y",
     "sp500", "djia",
 ]
@@ -49,6 +74,7 @@ SOURCE_URLS = {
     "unemployment": "https://ec.europa.eu/eurostat/databrowser/view/une_rt_m/default/table",
     "ip": "https://ec.europa.eu/eurostat/databrowser/view/sts_inpr_m/default/table",
     "gdp": "https://ec.europa.eu/eurostat/databrowser/view/namq_10_gdp/default/table",
+    "house_prices": "https://ec.europa.eu/eurostat/databrowser/view/prc_hpi_q/default/table",
 }
 
 
@@ -339,21 +365,54 @@ def _time_value(df: pd.DataFrame) -> pd.Series:
 
 def _fetch_hicp_level(client: EurostatClient, geo: str, start_m: str, end_m: str,
                       coicop: str = "CP00") -> pd.Series:
-    # 2026 HICP dissemination moved to a 2025=100 reference; try current then legacy bases.
-    candidates = [
-        {"geo": geo, "coicop": coicop, "unit": "I25"},
-        {"geo": geo, "coicop": coicop, "unit": "I15"},
-        {"geo": geo, "coicop": coicop},
+    """Current monthly HICP index from Eurostat, with a legacy-table fallback.
+
+    Eurostat moved HICP dissemination in 2026 to prc_hicp_minr (ECOICOP v2).
+    The headline/energy aggregate codes map cleanly: CP00 -> TOTAL and NRG -> NRG.
+    """
+    current_code = {"CP00": "TOTAL", "NRG": "NRG"}.get(coicop, coicop)
+    current = [
+        {"geo": geo, "coicop18": current_code, "unit": "I25"},
+        {"geo": geo, "coicop18": current_code, "unit": "I15"},
     ]
-    df = client.first_working("prc_hicp_midx", candidates, start_m, end_m)
-    # If no unit was specified and several units slipped through, prefer newest reference-base code.
-    if "unit" in df.columns and df["unit"].nunique() > 1:
-        for unit in ["I25", "I15", "I05"]:
-            x = df[df["unit"] == unit]
-            if not x.empty:
-                df = x
-                break
-    return _time_value(df)
+    try:
+        return _time_value(client.first_working("prc_hicp_minr", current, start_m, end_m))
+    except Exception:
+        legacy = [
+            {"geo": geo, "coicop": coicop, "unit": "I15"},
+            {"geo": geo, "coicop": coicop},
+        ]
+        return _time_value(client.first_working("prc_hicp_midx", legacy, start_m, end_m))
+
+
+def _fetch_house_price_index(client: EurostatClient, geo: str, start_q: str, end_q: str) -> pd.Series:
+    """Eurostat nominal House Price Index, total purchases, 2015=100, quarterly."""
+    candidates = [
+        {"geo": geo, "freq": "Q", "purchase": "TOTAL", "unit": "I15_Q"},
+        {"geo": geo, "purchase": "TOTAL", "unit": "I15_Q"},
+    ]
+    df = client.first_working("prc_hpi_q", candidates, start_q, end_q)
+    return _series_to_quarterly(_time_value(df))
+
+
+def _house_price_to_frequency(q: pd.Series, freq: str) -> pd.Series:
+    """Harmonise a native quarterly house-price index to the requested frequency.
+
+    Monthly output repeats the quarterly observation within its three months rather
+    than inventing intra-quarter price movements. Annual output averages quarters.
+    """
+    q = _series_to_quarterly(q)
+    if freq == "Q":
+        return q
+    if freq == "A":
+        return q.groupby(q.index.asfreq("Y")).mean()
+    if freq == "M":
+        out = {}
+        for qp, val in q.items():
+            for mp in pd.period_range(qp.asfreq("M", "start"), qp.asfreq("M", "end"), freq="M"):
+                out[mp] = val
+        return pd.Series(out, dtype=float).sort_index()
+    raise ValueError(freq)
 
 
 def _fetch_unemployment(client: EurostatClient, geo: str, start_m: str, end_m: str) -> pd.Series:
@@ -813,8 +872,19 @@ def fetch_macro_dataset(
         e = _series_to_monthly(_fetch_hicp_level(client, actual_geo, start_m, end_m, "NRG"))
         data["energy_index"] = _aggregate_monthly(e, freq, "mean")
         sources["energy_index"] = "Eurostat"
-        add_meta("Energy HICP", "Eurostat", "prc_hicp_midx (NRG)", "M", e,
-                 "ECB equivalent is not substituted unless the classification is exactly matched.")
+        add_meta("Energy HICP", "Eurostat", "prc_hicp_minr (NRG)", "M", e,
+                 "Eurostat HICP energy aggregate; current ECOICOP v2 table with legacy fallback.")
+
+    # Residential property prices. Eurostat HPI is natively quarterly. For a monthly
+    # workbook the quarterly observation is repeated within the quarter (no invented
+    # interpolation); annual output is the arithmetic mean of the available quarters.
+    if "house_price_index" in vars_set:
+        hpi_q = _fetch_house_price_index(client, actual_geo, start_q, end_q)
+        hpi = _house_price_to_frequency(hpi_q, freq)
+        data["house_price_index"] = hpi
+        sources["house_price_index"] = "Eurostat · prc_hpi_q"
+        add_meta("House price index", "Eurostat", "prc_hpi_q (TOTAL, I15_Q)", "Q", hpi_q,
+                 "Residential properties purchased by households, 2015=100. Monthly output repeats each quarterly value within its three months; annual output averages quarters.")
 
     # Unemployment
     if "unemployment_rate" in vars_set:
@@ -983,9 +1053,10 @@ def fetch_macro_dataset(
         eq, eq_sid = _fetch_country_equity_index(actual_geo, freq, start_year, end_year)
         data["country_equity_index"] = eq
         sources["country_equity_index"] = ("OECD" if not eq.empty else "Unavailable")
-        add_meta("Country equity index", "OECD" if not eq.empty else "Unavailable",
+        _idx_name = REFERENCE_EQUITY_INDEX.get(actual_geo, "National equity index")
+        add_meta(_idx_name, "OECD" if not eq.empty else "Unavailable",
                  eq_sid, "M", eq,
-                 "OECD Financial Market harmonised national share-price index, retrieved directly through the OECD SDMX API. Monthly observations are averaged for quarterly/annual output; unavailable country series are left blank.")
+                 f"{_idx_name} reference-market label; values use the OECD Financial Market harmonised national share-price series retrieved directly through the OECD SDMX API. Monthly observations are averaged for quarterly/annual output; unavailable country series are left blank.")
 
     target = _period_range(freq, start_year, end_year)
     out = pd.DataFrame(index=target)
@@ -1347,6 +1418,15 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     if "log_ip" in vars_set and ip_raw is not None:
         data["log_ip"]=np.log(_dated_to_period(ip_raw,freq,"M")); sources["log_ip"]="Derived from Federal Reserve INDPRO"
     if "energy_cpi" in vars_set: add("energy_cpi","CPIENGSL","BLS","M","CPI energy index, seasonally adjusted.")
+    if "house_price_index" in vars_set:
+        hraw = _fred_series("USSTHPI", start_year-1, end_year)
+        hq = pd.Series(hraw.values, index=hraw.index.to_period("Q")).groupby(level=0).last()
+        h = _house_price_to_frequency(hq, freq)
+        data["house_price_index"] = h
+        sources["house_price_index"] = "FHFA via FRED · USSTHPI"
+        meta.append(FetchMeta("House price index", "FHFA", "USSTHPI", "US", "Q",
+                              str(hq.dropna().index.max()) if not hq.dropna().empty else None,
+                              "FHFA All-Transactions House Price Index. Monthly output repeats each quarterly value within its three months; annual output averages quarters."))
     if "fed_funds" in vars_set: add("fed_funds","FEDFUNDS","Federal Reserve","M","Effective federal funds rate.")
     if "sofr" in vars_set: add("sofr","SOFR","Federal Reserve Bank of New York","M","Secured Overnight Financing Rate.")
     if "treasury_1y" in vars_set: add("treasury_1y","GS1","U.S. Treasury / Federal Reserve","M","1-year Treasury constant maturity rate.")
