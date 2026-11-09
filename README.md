@@ -65,7 +65,8 @@ Do not copy or commit `.venv`: a virtual environment only works on the machine a
 ## Sources
 
 - **Euro area:** ECB Data Portal and Eurostat (HICP, unemployment, industrial production, GDP, house prices); where both publish an equivalent series the longest and most recent is chosen. OECD harmonised share-price indices for national equity markets. ICE BofA Euro High Yield OAS via FRED.
-- **United States:** BEA (GDPC1), BLS (CPIAUCSL, UNRATE, CPIENGSL), Federal Reserve (INDPRO, FEDFUNDS, GS1, GS10), FRBNY (SOFR), FHFA (USSTHPI) and ICE BofA (BAMLH0A0HYM2), all through FRED. S&P 500 and Dow Jones from Yahoo Finance, because FRED licenses only their last ten years; if Yahoo is unreachable the FRED ten-year series is used and labelled as such.
+- **United States:** BEA (GDPC1), BLS (CPIAUCSL, UNRATE, CPIENGSL), Federal Reserve (INDPRO, FEDFUNDS, GS1, GS10), FRBNY (SOFR), FHFA (USSTHPI, from 1975Q1) and ICE BofA (BAMLH0A0HYM2), all through FRED. Moody's Baa–10Y Treasury spread (BAA10YM, from 1953) via FRED, and the Gilchrist–Zakrajšek credit spread and excess bond premium (from 1973) directly from the Federal Reserve Board.
+- **Corporate spreads and history:** since April 2026 FRED publishes only the last three years of every ICE BofA series (US and euro high-yield OAS), because of ICE's licence. Use the Baa–Treasury spread or the GZ spread / EBP for long samples. S&P 500 and Dow Jones from Yahoo Finance, because FRED licenses only their last ten years; if Yahoo is unreachable the FRED ten-year series is used and labelled as such.
 
 ## How FRED is reached
 
@@ -91,6 +92,10 @@ Requests are spaced to respect FRED's rate limit, retried on 429/5xx errors, and
 **Packages need refreshing.** Delete `.venv`; the next launch reinstalls everything. Otherwise packages are reinstalled only when `requirements.txt` changes.
 
 ## Changelog
+
+### v25.1
+- Added long-history US corporate spreads: Baa–10Y Treasury (Moody's, from 1953), GZ credit spread and excess bond premium (Federal Reserve Board, from 1973).
+- High-yield OAS is labelled "last 3 years": FRED truncated all ICE BofA series to a rolling three-year window in April 2026.
 
 ### v25
 - **US monthly downloads fixed.** The keyless FRED CSV fallback sent `cosd`/`coed` date windows, which that endpoint can ignore or answer with HTTP 404; it now downloads the plain series and slices locally, and validates that it received CSV rather than a maintenance page. FRED API errors now show FRED's own message.

@@ -34,6 +34,9 @@ ALIASES = {
     "hy_spread": ["hy_spread", "high_yield_spread", "corporate_hy_spread", "hy_oas"],
     "country_equity_index": ["country_equity_index", "equity_index", "share_price_index"],
     "sp500": ["sp500", "s&p500", "s_p_500"],
+    "baa_spread": ["baa_spread", "baa10y", "baa_treasury_spread"],
+    "gz_spread": ["gz_spread", "gz"],
+    "ebp": ["ebp", "excess_bond_premium"],
     "djia": ["djia", "dow_jones", "dow_jones_industrial_average"],
 }
 
@@ -45,7 +48,7 @@ PROTECTED_TOKENS = {"shock", "shocks", "fcst", "fcast", "forecast", "ois", "dfr"
 PROTECTED_PREFIXES = ("qe_", "fg_", "gpt_", "rr_", "jk_", "de_rate")
 
 LEVEL_SHIFT_THRESHOLD = 0.02   # 2% median gap between old and new values
-RATE_LIKE = ("rate", "growth", "inflation", "spread", "yield", "dfr", "mro", "estr", "sofr",
+RATE_LIKE = ("rate", "growth", "inflation", "spread", "yield", "ebp", "dfr", "mro", "estr", "sofr",
              "fed_funds", "treasury", "aaa", "sovereign")
 
 

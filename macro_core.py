@@ -69,7 +69,7 @@ US_VARS = [
     "cpi_level", "inflation_rate", "unemployment_rate",
     "ip", "log_ip", "energy_cpi", "house_price_index",
     "fed_funds", "sofr", "treasury_1y", "treasury_10y",
-    "sp500", "djia", "hy_spread",
+    "sp500", "djia", "hy_spread", "baa_spread", "gz_spread", "ebp",
 ]
 
 SOURCE_URLS = {
@@ -1285,7 +1285,8 @@ def fetch_macro_dataset(
                 data["hy_spread"] = hy
                 sources["hy_spread"] = "ICE BofA via FRED · BAMLHE00EHYIOAS"
                 add_meta("Euro high-yield OAS", "ICE BofA via FRED", "BAMLHE00EHYIOAS", "D", hy,
-                         "Euro-denominated high-yield corporate option-adjusted spread; percentage points, period average.")
+                         "Euro-denominated high-yield corporate option-adjusted spread; percentage points, period average. "
+                         "Since April 2026 FRED publishes only the last three years of ICE BofA data (licence restriction).")
             except Exception as exc:
                 data["hy_spread"] = pd.Series(dtype=float)
                 sources["hy_spread"] = "Unavailable: " + redact(exc)[:200]
@@ -1810,7 +1811,8 @@ _US_DIRECT = {
     "sofr": ("SOFR", "Federal Reserve Bank of New York", "D", "Secured Overnight Financing Rate, daily; averaged over each period. Starts April 2018."),
     "treasury_1y": ("GS1", "Federal Reserve H.15", "M", "1-year Treasury constant-maturity yield, monthly average, percent."),
     "treasury_10y": ("GS10", "Federal Reserve H.15", "M", "10-year Treasury constant-maturity yield, monthly average, percent."),
-    "hy_spread": ("BAMLH0A0HYM2", "ICE BofA via FRED", "D", "US high-yield corporate option-adjusted spread, percentage points; averaged over each period."),
+    "hy_spread": ("BAMLH0A0HYM2", "ICE BofA via FRED", "D", "US high-yield corporate option-adjusted spread, percentage points; averaged over each period. Since April 2026 FRED publishes only the last three years of ICE BofA data (licence restriction)."),
+    "baa_spread": ("BAA10YM", "Moody's via FRED", "M", "Moody's seasoned Baa corporate bond yield minus the 10-year Treasury constant-maturity yield, monthly, percentage points. Starts April 1953."),
 }
 _US_MARKETS = {
     "sp500": ("^GSPC", "SP500", "S&P 500"),
@@ -1823,7 +1825,40 @@ _US_LABELS = {
     "house_price_index": "House price index", "fed_funds": "Federal funds rate", "sofr": "SOFR",
     "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
     "sp500": "S&P 500", "djia": "Dow Jones Industrial Average", "hy_spread": "US high-yield OAS",
+    "baa_spread": "Baa-Treasury spread", "gz_spread": "GZ credit spread", "ebp": "Excess bond premium",
 }
+
+FED_EBP_URL = "https://www.federalreserve.gov/econres/notes/feds-notes/ebp_csv.csv"
+
+
+def fed_gz_ebp() -> pd.DataFrame:
+    """Gilchrist-Zakrajsek credit spread and excess bond premium (Federal Reserve Board).
+
+    Monthly from January 1973, percentage points. The Board revises the whole
+    history each month, so the file is cached like any other download.
+    """
+    cached = _CACHE.get(("fed", "ebp"))
+    if cached is not None:
+        return cached.copy()
+    r = _http_get(FED_EBP_URL, headers={"Accept": "text/csv,*/*;q=0.5"}, timeout=(6, 30),
+                  retries=2, label="Federal Reserve Board")
+    if r.status_code != 200:
+        raise DataError(f"Federal Reserve Board EBP file returned HTTP {r.status_code}")
+    text = (r.text or "").lstrip("\ufeff")
+    if "<html" in text[:300].lower():
+        raise DataError("Federal Reserve Board returned a web page instead of the EBP CSV")
+    df = pd.read_csv(io.StringIO(text))
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    if not {"date", "gz_spread", "ebp"} <= set(df.columns):
+        raise DataError(f"Unexpected EBP file columns: {list(df.columns)[:8]}")
+    idx = pd.to_datetime(df["date"], errors="coerce")
+    out = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce").to_numpy() for c in ("gz_spread", "ebp")},
+                       index=pd.DatetimeIndex(idx))
+    out = out[~out.index.isna()].sort_index()
+    if out.dropna(how="all").empty:
+        raise DataError("Federal Reserve Board EBP file contained no observations")
+    _CACHE.set(("fed", "ebp"), out)
+    return out.copy()
 
 
 def _latest(s: pd.Series) -> Optional[str]:
@@ -1888,6 +1923,8 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     for var, (symbol, fred_id, _label) in _US_MARKETS.items():
         if var in vars_set:
             jobs[var] = (lambda symbol=symbol, fred_id=fred_id: _market_daily(symbol, fred_id, start_year, key))
+    if {"gz_spread", "ebp"} & vars_set:
+        jobs["FED_EBP"] = fed_gz_ebp
 
     raw: Dict[str, object] = {}
     failed: Dict[str, str] = {}
@@ -2020,6 +2057,25 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
             meta.append(FetchMeta("House price index", "FHFA", "USSTHPI", "US", "Q", _latest(hq),
                                   "FHFA All-Transactions HPI, 1980Q1=100, not seasonally adjusted. Monthly output "
                                   "repeats each quarter's value; annual output averages quarters."))
+
+    # Gilchrist-Zakrajsek credit spread and excess bond premium
+    for var, label, note in (
+        ("gz_spread", "GZ credit spread",
+         "Gilchrist-Zakrajsek (2012) credit spread: average spread of senior unsecured corporate bonds over "
+         "matched Treasuries, percentage points, monthly from 1973. Whole history revised monthly by the Fed."),
+        ("ebp", "Excess bond premium",
+         "Gilchrist-Zakrajsek (2012) excess bond premium: the GZ spread net of expected default risk, "
+         "percentage points, monthly from 1973. Whole history revised monthly by the Fed."),
+    ):
+        if var not in vars_set:
+            continue
+        if "FED_EBP" not in raw:
+            unavailable(var, "ebp_csv.csv", failed.get("FED_EBP", "not downloaded"))
+            continue
+        s = _to_frequency(raw["FED_EBP"][var], freq, "M")
+        data[var] = s
+        sources[var] = "Federal Reserve Board · ebp_csv.csv"
+        meta.append(FetchMeta(label, "Federal Reserve Board", "ebp_csv.csv", "US", "M", _latest(s), note))
 
     # Equity indices
     for var, (symbol, fred_id, label) in _US_MARKETS.items():

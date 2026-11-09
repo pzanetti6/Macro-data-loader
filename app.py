@@ -44,7 +44,7 @@ EU_LABELS = {
     "aaa_1y": "AAA 1Y yield", "aaa_10y": "AAA 10Y yield",
     "sovereign_1y": "Sovereign 1Y yield", "sovereign_10y": "Sovereign 10Y yield",
     "eurostoxx50": "EURO STOXX 50", "country_equity_index": "National equity index",
-    "hy_spread": "High-yield spread (OAS)",
+    "hy_spread": "High-yield spread (OAS, last 3 years)",
 }
 US_LABELS = {
     "real_gdp": "Real GDP", "real_gdp_growth": "Real GDP growth", "log_real_gdp": "Log real GDP",
@@ -54,13 +54,17 @@ US_LABELS = {
     "fed_funds": "Federal funds rate", "sofr": "SOFR",
     "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
     "sp500": "S&P 500", "djia": "Dow Jones Industrial Average",
-    "hy_spread": "High-yield spread (OAS)",
+    "hy_spread": "High-yield spread (OAS, last 3 years)",
+    "baa_spread": "Baa-Treasury spread (from 1953)",
+    "gz_spread": "GZ credit spread (from 1973)",
+    "ebp": "Excess bond premium (from 1973)",
 }
 GROUPS = {
     "US": {
         "Macro": ["real_gdp", "real_gdp_growth", "log_real_gdp", "cpi_level",
                   "inflation_rate", "unemployment_rate", "ip", "log_ip"],
-        "Rates & money": ["fed_funds", "sofr", "treasury_1y", "treasury_10y", "hy_spread"],
+        "Rates & money": ["fed_funds", "sofr", "treasury_1y", "treasury_10y",
+                          "baa_spread", "gz_spread", "ebp", "hy_spread"],
         "Markets & prices": ["sp500", "djia", "house_price_index", "energy_cpi"],
     },
     "EU": {
@@ -97,7 +101,7 @@ CONSTRUCTION = {
     "ea_sovereign/convergence_10y_yield": "ECB long-term interest rate for convergence purposes (10Y), monthly; averaged for quarterly/annual output.",
     "country_sovereign_10y_yield": "ECB long-term interest rate for convergence purposes (10Y), monthly; averaged for quarterly/annual output.",
     "euro_stoxx_50": "ECB monthly EURO STOXX 50 (average of daily closes); averaged further for quarterly/annual output.",
-    "euro_high-yield_oas": "ICE BofA Euro High Yield OAS via FRED; daily values averaged over the period.",
+    "euro_high-yield_oas": "ICE BofA Euro High Yield OAS via FRED; daily values averaged over the period. FRED now carries only the last three years.",
 }
 
 
@@ -182,7 +186,7 @@ def meta_rows(meta, freq: str, method: str) -> list:
     return rows
 
 
-_RATE_LIKE = ("rate", "growth", "inflation", "spread", "yield", "dfr", "mro", "estr", "sofr",
+_RATE_LIKE = ("rate", "growth", "inflation", "spread", "yield", "ebp", "dfr", "mro", "estr", "sofr",
               "fed_funds", "treasury", "aaa", "sovereign", "shock", "gpt", "rr_", "jk_")
 
 
@@ -713,7 +717,10 @@ high-yield spread exists, so those are not offered.
 
 **United States.** BEA real GDP (GDPC1), BLS CPI-U (CPIAUCSL) and unemployment (UNRATE), Federal Reserve
 industrial production (INDPRO), federal funds (FEDFUNDS) and Treasury yields (GS1, GS10), FRBNY SOFR, FHFA house
-prices (USSTHPI) and ICE BofA high-yield OAS, all through FRED. S&P 500 and Dow Jones come from Yahoo Finance
+prices (USSTHPI, from 1975) and ICE BofA high-yield OAS, all through FRED. Since April 2026 FRED publishes only
+the last three years of ICE BofA spreads (US and euro), so for long samples use the Baa-Treasury spread (Moody's,
+monthly from 1953) or the Gilchrist-Zakrajšek credit spread and excess bond premium (Federal Reserve Board, monthly
+from 1973). S&P 500 and Dow Jones come from Yahoo Finance
 because FRED licenses only their last ten years.
 """)
     if st.button("Clear downloaded data", help="Forget the downloads kept for six hours and fetch fresh copies next time."):
