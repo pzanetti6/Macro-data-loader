@@ -1542,6 +1542,60 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     return out.reset_index(drop=True),meta
 
 
+def fetch_us_dataset_fast(freq, start_year, end_year, variables,
+                          monthly_gdp_method="Chow-Lin (industrial production)",
+                          deadline_seconds=18):
+    """Fetch independent US variable groups concurrently with a global wait deadline.
+
+    A timed-out provider never holds up the workbook. Worker network calls have
+    their own short timeouts, and missing columns are explicitly labelled.
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait
+    requested = list(dict.fromkeys(variables))
+    if not requested:
+        return fetch_us_dataset(freq, start_year, end_year, [], monthly_gdp_method)
+    groups = []
+    gdp = {"real_gdp", "real_gdp_growth", "log_real_gdp"}
+    cpi = {"cpi_level", "inflation_rate"}
+    ip = {"ip", "log_ip"}
+    for related in (gdp, cpi, ip):
+        chosen = [v for v in requested if v in related]
+        if chosen:
+            groups.append(chosen)
+    groups.extend([[v] for v in requested if v not in gdp | cpi | ip])
+    pool = ThreadPoolExecutor(max_workers=min(8, len(groups)))
+    futures = {pool.submit(fetch_us_dataset, freq, start_year, end_year,
+                           group, monthly_gdp_method): group for group in groups}
+    done, pending = wait(futures, timeout=deadline_seconds)
+    pool.shutdown(wait=False, cancel_futures=True)
+    target = _period_range(freq, start_year, end_year)
+    out = pd.DataFrame({"date": [_period_label(p, freq) for p in target]})
+    meta = []
+    for future, group in futures.items():
+        if future in done:
+            try:
+                part, partmeta = future.result()
+                for col in part.columns:
+                    if col != "date":
+                        out[col] = part[col].to_numpy()
+                meta.extend(partmeta)
+                continue
+            except Exception as exc:
+                reason = str(exc)[:240]
+        else:
+            reason = f"Source did not respond within {deadline_seconds}s global deadline"
+        for var in group:
+            out[var] = float("nan")
+            out[f"{var}_source"] = f"Unavailable: {reason}"
+            meta.append(FetchMeta(var, "Unavailable", "", "US", "",
+                                  None, reason))
+    ordered = ["date"]
+    for var in US_VARS:
+        if var in requested:
+            ordered.extend([var, f"{var}_source"])
+    return out[ordered], meta
+
+
 def fetch_country_panel(countries: Sequence[str], freq: str, start_year: int, end_year: int,
                         variables: Sequence[str], monthly_gdp_method: str,
                         progress=None) -> Tuple[Dict[str, pd.DataFrame], List[FetchMeta]]:

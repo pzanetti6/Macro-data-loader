@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from macro_core import (CANONICAL_VARS, US_VARS, COUNTRY_NAMES, EA19, DataError,
-                        fetch_country_panel, fetch_macro_dataset, fetch_us_dataset)
+                        fetch_country_panel, fetch_macro_dataset, fetch_us_dataset_fast)
 from excel_tools import create_workbook, update_workbook, workbook_sheet_names
 
 # User-facing reference names for national equity series. Kept local to the UI so
@@ -660,7 +660,7 @@ if run:
             prog.progress(0.80, text="Building output…")
         elif geography == "United States":
             prog.progress(0.15, text="Downloading official US series…")
-            df, meta = fetch_us_dataset(
+            df, meta = fetch_us_dataset_fast(
                 freq, int(start_year), int(end_year), selected_vars, monthly_gdp_method
             )
             datasets = {"US": df}
