@@ -149,3 +149,7 @@ the primary series and the metadata identifies its latest observation.
 
 ### v22 reliability update
 FRED series now have a DBnomics public FRED mirror fallback; US requests run concurrently with a 32-second overall deadline. HY OAS is selected from Rates & Money pills; there is no separate checkbox. The fallback is independently hosted and may not have identical release timing; verify latest observations in the metadata.
+
+
+### v23: FRED connectivity
+The previous DBnomics fallback returned 404 and has been removed. In United States mode, open **US data connection · FRED API key** and enter a free 32-character FRED API key. Alternatively, configure `FRED_API_KEY` in Streamlit Cloud app secrets. The loader queries the documented `api.stlouisfed.org/fred/series/observations` endpoint with `file_type=json`, and retains the keyless CSV endpoint as a fallback. The key is not stored in workbook output. FRED's official API requires an API key; without it, Streamlit Cloud may still fail to retrieve these series.

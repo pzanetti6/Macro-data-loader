@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from macro_core import (CANONICAL_VARS, US_VARS, COUNTRY_NAMES, EA19, DataError,
-                        fetch_country_panel, fetch_macro_dataset, fetch_us_dataset)
+                        fetch_country_panel, fetch_macro_dataset, fetch_us_dataset, configure_fred_api_key)
 # Compatible with deployments where app.py and macro_core.py update at different times.
 try:
     from macro_core import fetch_us_dataset_fast
@@ -610,6 +610,20 @@ if geography=="Euro-area countries":
         format_func=lambda x:f"{x} — {COUNTRY_NAMES.get(x,x)}"
     )
     panel_format=st.selectbox("Country workbook layout",["One sheet per country","Long panel"])
+
+if geography == "United States":
+    with st.expander("US data connection · FRED API key", expanded=True):
+        st.caption("FRED's keyless CSV host is timing out on Streamlit Cloud. Add a free FRED API key to enable the official authenticated API. Your key is not included in the Excel file.")
+        try:
+            configured_key = st.secrets.get("FRED_API_KEY", "")
+        except Exception:
+            configured_key = ""
+        fred_key_input = st.text_input("FRED API key (optional if configured in Streamlit secrets)",
+                                     type="password", key="fred_api_key_input",
+                                     help="Create a free key in your FRED account under API Keys; 32 lowercase letters/digits.")
+        configure_fred_api_key(fred_key_input or configured_key)
+        if not (fred_key_input or configured_key):
+            st.warning("No FRED API key configured. FRED-dependent series may fail if the public CSV host times out.")
 
 if geography=="United States":
     st.caption("US sources: BEA, BLS, Federal Reserve/FRBNY and U.S. Treasury series distributed through FRED. The workbook records the source and series ID beside each variable.")

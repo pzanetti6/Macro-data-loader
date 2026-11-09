@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 import itertools
 import math
 from dataclasses import dataclass
@@ -1159,63 +1160,75 @@ def fetch_macro_dataset(
     return out.reset_index(drop=True), meta
 
 
-def _fred_series(series_id: str, start_year: int, end_year: int) -> pd.Series:
-    """Try two independent public hosts with strict per-host timeouts.
+# Configured by the Streamlit UI or Streamlit Cloud secrets; never logged.
+_FRED_API_KEY = None
 
-    FRED graph CSV is sometimes blocked from Streamlit Cloud. DBnomics mirrors
-    FRED's public observations and provides an independent route without an API key.
+def configure_fred_api_key(key: str | None):
+    global _FRED_API_KEY
+    _FRED_API_KEY = (key or "").strip() or None
+
+
+def _fred_series(series_id: str, start_year: int, end_year: int) -> pd.Series:
+    """Official authenticated FRED API, then keyless FRED graph CSV fallback.
+
+    DBnomics FRED URLs were invalid and are intentionally removed.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    def direct():
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-        r = requests.get(url, params={"id": series_id,
-                         "cosd": f"{start_year}-01-01",
-                         "coed": f"{end_year}-12-31"},
-                         timeout=(3, 7), headers={"User-Agent": "Mozilla/5.0"})
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+    key = _FRED_API_KEY or os.environ.get("FRED_API_KEY", "").strip()
+    if key and not re.fullmatch(r"[a-z0-9]{32}", key):
+        raise DataError("FRED API key must contain 32 lowercase letters/digits; check the API key field")
+
+    def api():
+        r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                         params={"series_id": series_id, "api_key": key, "file_type": "json",
+                                 "observation_start": f"{start_year}-01-01",
+                                 "observation_end": f"{end_year}-12-31"},
+                         timeout=(4, 16))
+        r.raise_for_status()
+        rows = r.json().get("observations", [])
+        if not rows:
+            raise DataError(f"FRED API returned no observations for {series_id}")
+        dates = pd.to_datetime([x["date"] for x in rows], errors="coerce")
+        vals = pd.to_numeric(pd.Series([x.get("value") for x in rows]), errors="coerce")
+        return pd.Series(vals.to_numpy(), index=dates).dropna()
+
+    def csv():
+        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                         params={"id": series_id, "cosd": f"{start_year}-01-01",
+                                 "coed": f"{end_year}-12-31"},
+                         timeout=(4, 10), headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
         col = next((c for c in df.columns if c.upper() == series_id.upper()), None)
         if col is None:
             raise DataError(f"FRED CSV missing {series_id}")
-        dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-        val = pd.to_numeric(df[col], errors="coerce")
-        return pd.Series(val.to_numpy(), index=dt).dropna()
-
-    def mirror():
-        url = f"https://api.db.nomics.world/v22/series/FRED/{series_id}"
-        r = requests.get(url, params={"observations": 1}, timeout=(3, 9),
-                         headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        doc = r.json()
-        series = doc["series"]["docs"][0]
-        dates = pd.to_datetime(series["period"], errors="coerce")
-        vals = pd.to_numeric(pd.Series(series["value"]), errors="coerce")
+        dates = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+        vals = pd.to_numeric(df[col], errors="coerce")
         return pd.Series(vals.to_numpy(), index=dates).dropna()
 
-    pool = ThreadPoolExecutor(max_workers=2)
-    futures = [pool.submit(direct), pool.submit(mirror)]
+    jobs = [api, csv] if key else [csv]
+    pool = ThreadPoolExecutor(max_workers=len(jobs))
+    futures = [pool.submit(job) for job in jobs]
     errors = []
-    result = None
     try:
-        for future in as_completed(futures, timeout=13):
+        for f in as_completed(futures, timeout=19 if key else 12):
             try:
-                series = future.result()
-                series = series[~series.index.isna()].sort_index()
-                series = series[(series.index.year >= start_year) &
-                                (series.index.year <= end_year)]
+                series = f.result().sort_index()
+                series = series[~series.index.isna()]
                 if not series.empty:
-                    result = series
-                    break
-                errors.append("No observations in selected years")
+                    return series
+                errors.append("Empty observations")
             except Exception as exc:
-                errors.append(str(exc)[:140])
-    except TimeoutError:
-        errors.append("Hosts did not respond within 13 seconds")
+                errors.append(f"{type(exc).__name__}: {str(exc)[:130]}")
+    except FuturesTimeout:
+        errors.append("Provider response timeout")
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    if result is None:
-        raise DataError(f"{series_id}: FRED and DBnomics unavailable: {'; '.join(errors)}")
-    return result
+    if not key:
+        raise DataError(f"{series_id}: FRED CSV failed ({'; '.join(errors)}). "
+                        "Add a free FRED API key in the US source settings to use the official API.")
+    raise DataError(f"{series_id}: official FRED API and CSV failed: {'; '.join(errors)}")
 
 def _hy_spread_fred(series_id: str, start_year: int, end_year: int, freq: str) -> pd.Series:
     raw = _fred_series(series_id, start_year, end_year)
