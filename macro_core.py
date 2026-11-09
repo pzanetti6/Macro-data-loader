@@ -1160,54 +1160,66 @@ def fetch_macro_dataset(
 
 
 def _fred_series(series_id: str, start_year: int, end_year: int) -> pd.Series:
-    """Bounded FRED CSV retrieval. Never cascade into dozens of slow decade requests."""
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-    params = {"id": series_id, "cosd": f"{start_year}-01-01",
-              "coed": f"{end_year}-12-31"}
-    errors = []
-    for attempt in range(2):
-        try:
-            r = requests.get(url, params=params, timeout=(4, 12),
-                             headers={"User-Agent": "Mozilla/5.0 MacroDataLoader/1.0"})
-            r.raise_for_status()
-            df = pd.read_csv(io.StringIO(r.text))
-            col = next((c for c in df.columns if c.upper() == series_id.upper()), None)
-            if col is None:
-                raise DataError(f"FRED {series_id}: missing data column")
-            dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-            vals = pd.to_numeric(df[col], errors="coerce")
-            out = pd.Series(vals.to_numpy(), index=dt).dropna()
-            out = out[~out.index.isna()].sort_index()
-            if out.empty:
-                raise DataError(f"FRED {series_id}: no observations")
-            return out
-        except (requests.RequestException, ValueError, DataError, pd.errors.ParserError) as exc:
-            errors.append(str(exc))
-    raise DataError(f"FRED {series_id} unavailable after 2 bounded attempts: {errors[-1]}")
+    """Try two independent public hosts with strict per-host timeouts.
 
-def _hy_spread_fred(series_id: str, start_year: int, end_year: int, freq: str) -> pd.Series:
-    """ICE BofA HY option-adjusted spread in percentage points, via FRED CSV.
-
-    A single bounded request; failure is isolated so other variables still export.
+    FRED graph CSV is sometimes blocked from Streamlit Cloud. DBnomics mirrors
+    FRED's public observations and provides an independent route without an API key.
     """
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-    params = {"id": series_id, "cosd": f"{start_year}-01-01", "coed": f"{end_year}-12-31"}
-    try:
-        r = requests.get(url, params=params, timeout=(5, 18),
-                         headers={"User-Agent": "Macro-Data-Loader/1.0"})
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    def direct():
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+        r = requests.get(url, params={"id": series_id,
+                         "cosd": f"{start_year}-01-01",
+                         "coed": f"{end_year}-12-31"},
+                         timeout=(3, 7), headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
-        if series_id not in df.columns:
-            raise DataError("Missing spread column")
+        col = next((c for c in df.columns if c.upper() == series_id.upper()), None)
+        if col is None:
+            raise DataError(f"FRED CSV missing {series_id}")
         dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-        values = pd.to_numeric(df[series_id], errors="coerce")
-        raw = pd.Series(values.to_numpy(), index=dt).dropna()
-        raw = raw[~raw.index.isna()]
-        if raw.empty:
-            raise DataError("No spread observations")
-        return _dated_to_period(raw, freq, "D")
-    except Exception as exc:
-        raise DataError(f"FRED {series_id}: {exc}") from exc
+        val = pd.to_numeric(df[col], errors="coerce")
+        return pd.Series(val.to_numpy(), index=dt).dropna()
+
+    def mirror():
+        url = f"https://api.db.nomics.world/v22/series/FRED/{series_id}"
+        r = requests.get(url, params={"observations": 1}, timeout=(3, 9),
+                         headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        doc = r.json()
+        series = doc["series"]["docs"][0]
+        dates = pd.to_datetime(series["period"], errors="coerce")
+        vals = pd.to_numeric(pd.Series(series["value"]), errors="coerce")
+        return pd.Series(vals.to_numpy(), index=dates).dropna()
+
+    pool = ThreadPoolExecutor(max_workers=2)
+    futures = [pool.submit(direct), pool.submit(mirror)]
+    errors = []
+    result = None
+    try:
+        for future in as_completed(futures, timeout=13):
+            try:
+                series = future.result()
+                series = series[~series.index.isna()].sort_index()
+                series = series[(series.index.year >= start_year) &
+                                (series.index.year <= end_year)]
+                if not series.empty:
+                    result = series
+                    break
+                errors.append("No observations in selected years")
+            except Exception as exc:
+                errors.append(str(exc)[:140])
+    except TimeoutError:
+        errors.append("Hosts did not respond within 13 seconds")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if result is None:
+        raise DataError(f"{series_id}: FRED and DBnomics unavailable: {'; '.join(errors)}")
+    return result
+
+def _hy_spread_fred(series_id: str, start_year: int, end_year: int, freq: str) -> pd.Series:
+    raw = _fred_series(series_id, start_year, end_year)
+    return _dated_to_period(raw, freq, "D")
 
 
 def _yahoo_market_series(symbol: str, start_year: int, end_year: int, freq: str) -> pd.Series:
@@ -1563,7 +1575,7 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
 
 def fetch_us_dataset_fast(freq, start_year, end_year, variables,
                           monthly_gdp_method="Chow-Lin (industrial production)",
-                          deadline_seconds=18):
+                          deadline_seconds=32):
     """Fetch independent US variable groups concurrently with a global wait deadline.
 
     A timed-out provider never holds up the workbook. Worker network calls have

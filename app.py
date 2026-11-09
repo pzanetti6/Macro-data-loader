@@ -590,19 +590,8 @@ for _card, (_group_name, _group_vars) in zip(_cards, variable_groups.items()):
             else:
                 st.caption("No series available for this dataset.")
 
-# Always-visible dedicated credit-spread selector, independent of wrapped pills.
-st.markdown("**Corporate credit spreads**")
-_hy_label = ("US ICE BofA High Yield OAS (FRED)" if geography == "United States" else
-             "Euro-denominated ICE BofA High Yield OAS (FRED)" if geography == "Euro area" else
-             "Country corporate HY spread (no verified comparable national series)")
-_hy_selected = st.checkbox(_hy_label, value=("hy_spread" in selected_vars),
-                           key=f"hy_visible_{geography}",
-                           help="For individual EA countries, no validated country-level HY OAS is available; values will be blank.")
-if _hy_selected and "hy_spread" not in selected_vars:
-    selected_vars.append("hy_spread")
-if not _hy_selected and "hy_spread" in selected_vars:
-    selected_vars.remove("hy_spread")
-
+# HY spreads are selected through the Rates & Money pills above, like all other series.
+# No separate corporate-spread checkbox.
 st.caption(f"{len(selected_vars)} of {len(available_vars)} available series selected.")
 
 monthly_gdp_method="Chow-Lin (industrial production)"

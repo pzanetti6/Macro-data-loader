@@ -145,3 +145,7 @@ The annual HICP inflation rate now prioritizes the latest published monthly obse
 with the ECB Data Portal annual-rate series preferred when equally up to date. Older
 observations may be backfilled from equivalent sources. The source column records
 the primary series and the metadata identifies its latest observation.
+
+
+### v22 reliability update
+FRED series now have a DBnomics public FRED mirror fallback; US requests run concurrently with a 32-second overall deadline. HY OAS is selected from Rates & Money pills; there is no separate checkbox. The fallback is independently hosted and may not have identical release timing; verify latest observations in the metadata.
