@@ -139,3 +139,9 @@ Frequency harmonisation for house prices is deliberately conservative: quarterly
 
 ### v15 HPI country fix
 Country HPI retrieval now downloads the small Eurostat `prc_hpi_q` country slice and selects TOTAL purchases and the newest available index base locally, avoiding brittle hard-coded unit filters.
+
+### v21 — HICP annual inflation freshness
+The annual HICP inflation rate now prioritizes the latest published monthly observation,
+with the ECB Data Portal annual-rate series preferred when equally up to date. Older
+observations may be backfilled from equivalent sources. The source column records
+the primary series and the metadata identifies its latest observation.

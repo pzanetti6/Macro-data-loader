@@ -911,11 +911,30 @@ def fetch_macro_dataset(
                 errors_rate.append(f"ECB index fallback: {exc2}")
         if not candidates_rate:
             raise DataError("HICP rate: " + " | ".join(errors_rate))
-        src, hr, sid = _choose_longest(candidates_rate)
+        # Annual HICP inflation is a published monthly rate, not a rate inferred
+        # from a potentially stale index-base vintage.  Select the candidate
+        # with the freshest observed month, then fill earlier gaps from other
+        # equivalent candidates.  ECB is the tie-breaker when equally fresh.
+        usable = [(source, series.dropna().sort_index(), series_id)
+                  for source, series, series_id in candidates_rate
+                  if series is not None and not series.dropna().empty]
+        usable.sort(key=lambda x: (x[1].index.max().ordinal,
+                                   1 if x[0] == "ECB" else 0,
+                                   len(x[1])), reverse=True)
+        src, hr, sid = usable[0]
+        latest_primary = hr.index.max()
+        # Only backfill history: never overwrite the freshest published value
+        # with a different source or a derived index-based annual rate.
+        for fallback_source, fallback, fallback_sid in usable[1:]:
+            earlier = fallback[fallback.index < hr.index.min()]
+            if not earlier.empty:
+                hr = pd.concat([earlier, hr]).sort_index()
         data["hicp_rate"] = _aggregate_monthly(hr, freq, "mean")
-        sources["hicp_rate"] = src
+        sources["hicp_rate"] = f"{src} · {sid}"
         add_meta("HICP rate", src, sid, "M", hr,
-                 f"Longest/freshest annual-rate series. Range: {hr.dropna().index.min()} to {hr.dropna().index.max()}.")
+                 f"Published annual % change; freshest source selected first. "
+                 f"Latest direct observation: {latest_primary}. "
+                 "Earlier history may be extended from an equivalent alternative source.")
 
     # Energy HICP: Eurostat is authoritative mapping in the app; ECB candidate is
     # deliberately not guessed because the ICP classification differs from Eurostat's NRG aggregate.
