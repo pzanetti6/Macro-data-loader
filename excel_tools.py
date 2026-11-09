@@ -25,6 +25,7 @@ ALIASES = {
     "energy_cpi": ["energy_cpi", "us_energy_cpi"],
     "house_price_index": ["house_price_index", "house_prices", "hpi", "residential_property_price_index"],
     "eurostoxx50": ["eurostoxx50", "euro_stoxx_50", "stoxx50", "sx5e"],
+    "hy_spread": ["hy_spread", "high_yield_spread", "corporate_hy_spread", "hy_oas"],
     "country_equity_index": ["country_equity_index", "equity_index", "share_price_index"],
     "sp500": ["sp500", "s&p500", "s_p_500"],
     "djia": ["djia", "dow_jones", "dow_jones_industrial_average"],

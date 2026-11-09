@@ -58,7 +58,7 @@ CANONICAL_VARS = [
     "unemployment_rate", "ip", "log_ip", "energy_index", "house_price_index",
     "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
     "sovereign_1y", "sovereign_10y",
-    "eurostoxx50", "country_equity_index",
+    "eurostoxx50", "country_equity_index", "hy_spread",
 ]
 
 US_VARS = [
@@ -66,7 +66,7 @@ US_VARS = [
     "cpi_level", "inflation_rate", "unemployment_rate",
     "ip", "log_ip", "energy_cpi", "house_price_index",
     "fed_funds", "sofr", "treasury_1y", "treasury_10y",
-    "sp500", "djia",
+    "sp500", "djia", "hy_spread",
 ]
 
 SOURCE_URLS = {
@@ -140,7 +140,7 @@ def _decode_jsonstat(js: dict) -> pd.DataFrame:
 
 
 class EurostatClient:
-    def __init__(self, timeout: int = 45):
+    def __init__(self, timeout: int = 14):
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "EA-Macro-Updater/1.0"})
@@ -160,7 +160,10 @@ class EurostatClient:
         if end:
             params.append(("untilTimePeriod", end))
         url = f"{EUROSTAT_STATS}/{dataset}"
-        r = self.session.get(url, params=params, timeout=self.timeout)
+        try:
+            r = self.session.get(url, params=params, timeout=(5, self.timeout))
+        except requests.RequestException as exc:
+            raise DataError(f"Eurostat {dataset}: network request failed: {exc}") from exc
         if r.status_code != 200:
             raise DataError(f"Eurostat {dataset} returned HTTP {r.status_code}: {r.text[:240]}")
         js = r.json()
@@ -365,24 +368,30 @@ def _time_value(df: pd.DataFrame) -> pd.Series:
 
 def _fetch_hicp_level(client: EurostatClient, geo: str, start_m: str, end_m: str,
                       coicop: str = "CP00") -> pd.Series:
-    """Current monthly HICP index from Eurostat, with a legacy-table fallback.
+    """Current HICP: one geo+component request, then choose index unit locally.
 
-    Eurostat moved HICP dissemination in 2026 to prc_hicp_minr (ECOICOP v2).
-    The headline/energy aggregate codes map cleanly: CP00 -> TOTAL and NRG -> NRG.
+    Avoid sequential attempts for every base-year code, a major timeout multiplier.
     """
-    current_code = {"CP00": "TOTAL", "NRG": "NRG"}.get(coicop, coicop)
-    current = [
-        {"geo": geo, "coicop18": current_code, "unit": "I25"},
-        {"geo": geo, "coicop18": current_code, "unit": "I15"},
-    ]
-    try:
-        return _time_value(client.first_working("prc_hicp_minr", current, start_m, end_m))
-    except Exception:
-        legacy = [
-            {"geo": geo, "coicop": coicop, "unit": "I15"},
-            {"geo": geo, "coicop": coicop},
-        ]
-        return _time_value(client.first_working("prc_hicp_midx", legacy, start_m, end_m))
+    code = {"CP00": "TOTAL", "NRG": "NRG"}.get(coicop, coicop)
+    errors = []
+    for dataset, dim, component in (("prc_hicp_minr", "coicop18", code),
+                                    ("prc_hicp_midx", "coicop", coicop)):
+        try:
+            df = client.query(dataset, {"geo": geo, dim: component}, start_m, end_m)
+            if df.empty:
+                raise DataError("No observations")
+            if "unit" in df.columns:
+                units = [str(x) for x in df["unit"].dropna().unique()]
+                selected = next((x for x in ("I25", "I15", "I10") if x in units), None)
+                if selected is None:
+                    selected = next((x for x in units if x.startswith("I")), None)
+                if selected is None:
+                    raise DataError(f"No HICP index unit in {units}")
+                df = df[df["unit"].astype(str) == selected]
+            return _time_value(df)
+        except Exception as exc:
+            errors.append(f"{dataset}: {exc}")
+    raise DataError("HICP index unavailable: " + " | ".join(errors))
 
 
 def _fetch_house_price_index(client: EurostatClient, geo: str, start_q: str, end_q: str) -> pd.Series:
@@ -395,10 +404,7 @@ def _fetch_house_price_index(client: EurostatClient, geo: str, start_q: str, end
     """
     # First try a minimally filtered country slice.  One country over the requested
     # window is small (purchase x unit x quarter) and avoids brittle SDMX code guesses.
-    attempts = [
-        {"geo": geo, "freq": "Q"},
-        {"geo": geo},
-    ]
+    attempts = [{"geo": geo, "freq": "Q"}]
     df = None
     errors = []
     for filt in attempts:
@@ -1002,6 +1008,26 @@ def fetch_macro_dataset(
         add_meta("Real GDP", src, sid, "Q", gq,
                  f"Selected for longest history. First observation: {gq.dropna().index.min()}.")
 
+    if "hy_spread" in vars_set:
+        # ICE BofA Euro HY OAS is a euro-denominated market benchmark, not a
+        # residence-of-issuer country spread. Never mislabel it as national HY.
+        if requested_ea or str(actual_geo).startswith("EA"):
+            try:
+                hy = _hy_spread_fred("BAMLHE00EHYIOAS", start_year, end_year, freq)
+                data["hy_spread"] = hy
+                sources["hy_spread"] = "ICE BofA via FRED · BAMLHE00EHYIOAS"
+                add_meta("Euro high-yield OAS", "ICE BofA via FRED", "BAMLHE00EHYIOAS", "D", hy,
+                         "Euro-denominated high-yield corporate option-adjusted spread; percentage points, period average.")
+            except Exception as exc:
+                data["hy_spread"] = pd.Series(dtype=float)
+                sources["hy_spread"] = "Unavailable: " + str(exc)[:120]
+                add_meta("Euro high-yield OAS", "Unavailable", "BAMLHE00EHYIOAS", "D", data["hy_spread"], str(exc))
+        else:
+            data["hy_spread"] = pd.Series(dtype=float)
+            sources["hy_spread"] = "Not available as a comparable country-specific HY OAS"
+            add_meta("Country high-yield OAS", "Unavailable", "No verified national HY OAS", "D", data["hy_spread"],
+                     "No validated country-resident HY OAS from ECB/FRED. Left blank rather than substituting euro-wide spread.")
+
     # Country-specific sovereign yields.
     # For EA aggregate output the AAA curve remains available separately via
     # aaa_1y / aaa_10y. For individual countries, sovereign_* means that country's
@@ -1115,69 +1141,54 @@ def fetch_macro_dataset(
 
 
 def _fred_series(series_id: str, start_year: int, end_year: int) -> pd.Series:
-    """Download a public FRED series without an API key, with Streamlit-safe retries.
+    """Bounded FRED CSV retrieval. Never cascade into dozens of slow decade requests."""
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    params = {"id": series_id, "cosd": f"{start_year}-01-01",
+              "coed": f"{end_year}-12-31"}
+    errors = []
+    for attempt in range(2):
+        try:
+            r = requests.get(url, params=params, timeout=(4, 12),
+                             headers={"User-Agent": "Mozilla/5.0 MacroDataLoader/1.0"})
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            col = next((c for c in df.columns if c.upper() == series_id.upper()), None)
+            if col is None:
+                raise DataError(f"FRED {series_id}: missing data column")
+            dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+            vals = pd.to_numeric(df[col], errors="coerce")
+            out = pd.Series(vals.to_numpy(), index=dt).dropna()
+            out = out[~out.index.isna()].sort_index()
+            if out.empty:
+                raise DataError(f"FRED {series_id}: no observations")
+            return out
+        except (requests.RequestException, ValueError, DataError, pd.errors.ParserError) as exc:
+            errors.append(str(exc))
+    raise DataError(f"FRED {series_id} unavailable after 2 bounded attempts: {errors[-1]}")
 
-    FRED occasionally responds slowly to cloud-hosted requests. Retry transient network
-    failures / 429 / 5xx responses with exponential backoff. If a long request still
-    fails, retry in 10-year chunks and combine the results.
+def _hy_spread_fred(series_id: str, start_year: int, end_year: int, freq: str) -> pd.Series:
+    """ICE BofA HY option-adjusted spread in percentage points, via FRED CSV.
+
+    A single bounded request; failure is isolated so other variables still export.
     """
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Macro-Data-Updater/1.0"})
-    transient = {429, 500, 502, 503, 504}
-
-    def one_request(y0: int, y1: int) -> pd.Series:
-        params = {"id": series_id, "cosd": f"{y0}-01-01", "coed": f"{y1}-12-31"}
-        last_error = None
-        for attempt in range(5):
-            try:
-                r = session.get(url, params=params, timeout=(10, 60))
-                if r.status_code == 200:
-                    df = pd.read_csv(io.StringIO(r.text))
-                    if df.empty or series_id not in df.columns:
-                        raise DataError(f"FRED {series_id}: no observations returned.")
-                    dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-                    vals = pd.to_numeric(df[series_id], errors="coerce")
-                    out = pd.Series(vals.values, index=dt).dropna()
-                    out = out[~out.index.isna()].sort_index()
-                    if out.empty:
-                        raise DataError(f"FRED {series_id}: no numeric observations returned.")
-                    return out
-                if r.status_code not in transient:
-                    raise DataError(f"FRED {series_id} returned HTTP {r.status_code}.")
-                last_error = f"HTTP {r.status_code}"
-                retry_after = r.headers.get("Retry-After")
-                try:
-                    wait = float(retry_after) if retry_after else 1.5 * (2 ** attempt)
-                except (TypeError, ValueError):
-                    wait = 1.5 * (2 ** attempt)
-            except (requests.Timeout, requests.ConnectionError) as exc:
-                last_error = str(exc)
-                wait = 1.5 * (2 ** attempt)
-            if attempt < 4:
-                time.sleep(min(wait, 20))
-        raise DataError(f"FRED {series_id}: request failed after retries ({last_error}).")
-
+    params = {"id": series_id, "cosd": f"{start_year}-01-01", "coed": f"{end_year}-12-31"}
     try:
-        return one_request(start_year, end_year)
-    except DataError as full_error:
-        # Long cloud requests are the most likely to time out. Split them without
-        # changing the requested sample or silently dropping observations.
-        if end_year - start_year < 10:
-            raise full_error
-        pieces = []
-        errors = []
-        for y0 in range(start_year, end_year + 1, 10):
-            y1 = min(y0 + 9, end_year)
-            try:
-                pieces.append(one_request(y0, y1))
-            except DataError as exc:
-                errors.append(f"{y0}-{y1}: {exc}")
-        if not pieces:
-            raise DataError(f"FRED {series_id}: full and chunked downloads failed. " + "; ".join(errors[:3]))
-        out = pd.concat(pieces)
-        out = out[~out.index.duplicated(keep="last")].sort_index()
-        return out
+        r = requests.get(url, params=params, timeout=(5, 18),
+                         headers={"User-Agent": "Macro-Data-Loader/1.0"})
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        if series_id not in df.columns:
+            raise DataError("Missing spread column")
+        dt = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+        values = pd.to_numeric(df[series_id], errors="coerce")
+        raw = pd.Series(values.to_numpy(), index=dt).dropna()
+        raw = raw[~raw.index.isna()]
+        if raw.empty:
+            raise DataError("No spread observations")
+        return _dated_to_period(raw, freq, "D")
+    except Exception as exc:
+        raise DataError(f"FRED {series_id}: {exc}") from exc
 
 
 def _yahoo_market_series(symbol: str, start_year: int, end_year: int, freq: str) -> pd.Series:
@@ -1464,33 +1475,63 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
         data["log_ip"]=np.log(_dated_to_period(ip_raw,freq,"M")); sources["log_ip"]="Derived from Federal Reserve INDPRO"
     if "energy_cpi" in vars_set: add("energy_cpi","CPIENGSL","BLS","M","CPI energy index, seasonally adjusted.")
     if "house_price_index" in vars_set:
-        hraw = _fred_series("USSTHPI", start_year-1, end_year)
-        hq = pd.Series(hraw.values, index=hraw.index.to_period("Q")).groupby(level=0).last()
-        h = _house_price_to_frequency(hq, freq)
-        data["house_price_index"] = h
-        sources["house_price_index"] = "FHFA via FRED · USSTHPI"
-        meta.append(FetchMeta("House price index", "FHFA", "USSTHPI", "US", "Q",
-                              str(hq.dropna().index.max()) if not hq.dropna().empty else None,
-                              "FHFA All-Transactions House Price Index. Monthly output repeats each quarterly value within its three months; annual output averages quarters."))
+        try:
+            hraw = _fred_series("USSTHPI", start_year-1, end_year)
+            hq = pd.Series(hraw.values, index=hraw.index.to_period("Q")).groupby(level=0).last()
+            h = _house_price_to_frequency(hq, freq)
+            data["house_price_index"] = h
+            sources["house_price_index"] = "FHFA via FRED · USSTHPI"
+            meta.append(FetchMeta("House price index", "FHFA via FRED", "USSTHPI", "US", "Q",
+                                  str(hq.dropna().index.max()) if not hq.dropna().empty else None,
+                                  "FHFA All-Transactions HPI; quarterly native, repeated in monthly output."))
+        except Exception as exc:
+            data["house_price_index"] = pd.Series(dtype=float)
+            sources["house_price_index"] = "Unavailable: " + str(exc)[:120]
+            meta.append(FetchMeta("House price index", "Unavailable", "USSTHPI", "US", "Q", None,
+                                  f"Download failed without blocking other selected series: {exc}"))
     if "fed_funds" in vars_set: add("fed_funds","FEDFUNDS","Federal Reserve","M","Effective federal funds rate.")
     if "sofr" in vars_set: add("sofr","SOFR","Federal Reserve Bank of New York","M","Secured Overnight Financing Rate.")
     if "treasury_1y" in vars_set: add("treasury_1y","GS1","U.S. Treasury / Federal Reserve","M","1-year Treasury constant maturity rate.")
     if "treasury_10y" in vars_set: add("treasury_10y","GS10","U.S. Treasury / Federal Reserve","M","10-year Treasury constant maturity rate.")
 
+    if "hy_spread" in vars_set:
+        try:
+            hy = _hy_spread_fred("BAMLH0A0HYM2", start_year, end_year, freq)
+            data["hy_spread"] = hy
+            sources["hy_spread"] = "ICE BofA via FRED · BAMLH0A0HYM2"
+            meta.append(FetchMeta("US high-yield OAS", "ICE BofA via FRED", "BAMLH0A0HYM2", "US", "D",
+                                  str(hy.dropna().index.max()) if not hy.dropna().empty else None,
+                                  "US high-yield corporate option-adjusted spread; percentage points, period average."))
+        except Exception as exc:
+            data["hy_spread"] = pd.Series(dtype=float)
+            sources["hy_spread"] = "Unavailable: " + str(exc)[:120]
+            meta.append(FetchMeta("US high-yield OAS", "Unavailable", "BAMLH0A0HYM2", "US", "D", None, str(exc)))
+
     # US equity benchmarks: daily closing price indices distributed through FRED.
     # Aggregate by arithmetic mean within month/quarter/year for consistency with
     # the ECB EURO STOXX period-average convention.
     for var, symbol, label in [("sp500", "^GSPC", "S&P 500"), ("djia", "^DJI", "Dow Jones Industrial Average")]:
-        if var in vars_set:
-            s = _yahoo_market_series(symbol, start_year, end_year, freq)
-            data[var] = s
-            sources[var] = f"Yahoo Finance · {symbol}"
-            note = ("Monthly month-end closing index from Yahoo Finance. "
-                    "Quarterly/annual values are arithmetic means of monthly closes. "
-                    "Compact monthly retrieval avoids the slow FRED market-data route.")
-            meta.append(FetchMeta(label, "Yahoo Finance", symbol, "US", "M",
-                                  str(s.dropna().index.max()) if not s.dropna().empty else None, note))
-
+        if var not in vars_set:
+            continue
+        try:
+            market = _yahoo_market_series(symbol, start_year, end_year, freq)
+            source, sid = "Yahoo Finance", symbol
+        except Exception as yahoo_error:
+            try:
+                sid = "SP500" if var == "sp500" else "DJIA"
+                market = _dated_to_period(_fred_series(sid, start_year, end_year), freq, "D")
+                source = "FRED"
+            except Exception as fred_error:
+                market = pd.Series(dtype=float)
+                source = "Unavailable"
+                sid = f"{symbol} / FRED"
+                failure = f"Yahoo: {yahoo_error}; FRED: {fred_error}"
+        data[var] = market
+        sources[var] = f"{source} · {sid}" if not market.empty else "Unavailable"
+        meta.append(FetchMeta(label, source, sid, "US", "M",
+                              str(market.dropna().index.max()) if not market.dropna().empty else None,
+                              ("Monthly market values, aggregated to requested frequency."
+                               if not market.empty else f"Download failed without blocking workbook: {failure}")))
     target=_period_range(freq,start_year,end_year)
     out=pd.DataFrame(index=target)
     for var in US_VARS:
@@ -1504,17 +1545,26 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
 def fetch_country_panel(countries: Sequence[str], freq: str, start_year: int, end_year: int,
                         variables: Sequence[str], monthly_gdp_method: str,
                         progress=None) -> Tuple[Dict[str, pd.DataFrame], List[FetchMeta]]:
-    client = EurostatClient()
-    results: Dict[str, pd.DataFrame] = {}
-    all_meta: List[FetchMeta] = []
-    n = max(len(countries), 1)
-    for i, geo in enumerate(countries):
-        if progress:
-            progress(i / n, f"Downloading {COUNTRY_NAMES.get(geo, geo)} ({geo})…")
-        df, meta = fetch_macro_dataset(geo, freq, start_year, end_year, variables,
-                                       monthly_gdp_method, client=client)
-        results[geo] = df
-        all_meta.extend(meta)
-    if progress:
-        progress(1.0, "Finished")
-    return results, all_meta
+    """Download country panels concurrently, with independent HTTP sessions."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = {}
+    metas = {}
+    errors = {}
+    countries = list(countries)
+    def worker(geo):
+        return fetch_macro_dataset(geo, freq, start_year, end_year, variables,
+                                   monthly_gdp_method, client=EurostatClient())
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(countries)))) as pool:
+        futures = {pool.submit(worker, geo): geo for geo in countries}
+        for i, future in enumerate(as_completed(futures), 1):
+            geo = futures[future]
+            try:
+                results[geo], metas[geo] = future.result()
+            except Exception as exc:
+                errors[geo] = str(exc)
+            if progress:
+                progress(i / max(1, len(countries)), f"Completed {i}/{len(countries)} countries")
+    if errors:
+        raise DataError("Country downloads failed: " + "; ".join(f"{c}: {e}" for c, e in errors.items()))
+    return ({c: results[c] for c in countries},
+            [item for c in countries for item in metas[c]])

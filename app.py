@@ -505,6 +505,7 @@ eu_labels={
     "sovereign_1y":"Sovereign 1Y yield","sovereign_10y":"Sovereign 10Y yield",
     "eurostoxx50":"EURO STOXX 50 equity index",
     "country_equity_index":"National reference equity index",
+    "hy_spread":"Corporate high-yield spread (OAS)",
 }
 us_labels={
     "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
@@ -514,6 +515,7 @@ us_labels={
     "fed_funds":"Effective federal funds rate","sofr":"SOFR",
     "treasury_1y":"US Treasury 1Y yield","treasury_10y":"US Treasury 10Y yield",
     "sp500":"S&P 500","djia":"Dow Jones Industrial Average",
+    "hy_spread":"Corporate high-yield spread (OAS)",
 }
 labels=us_labels if geography=="United States" else eu_labels
 if geography == "United States":
@@ -536,7 +538,7 @@ if geography == "United States":
             "inflation_rate", "unemployment_rate", "ip", "log_ip",
         ],
         "Rates & Money": [
-            "fed_funds", "sofr", "treasury_1y", "treasury_10y",
+            "fed_funds", "sofr", "treasury_1y", "treasury_10y", "hy_spread",
         ],
         "Financial / Other Indexes": [
             "sp500", "djia", "house_price_index", "energy_cpi",
@@ -550,7 +552,7 @@ else:
         ],
         "Rates & Money": [
             "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
-            "sovereign_1y", "sovereign_10y",
+            "sovereign_1y", "sovereign_10y", "hy_spread",
         ],
         "Financial / Other Indexes": [
             "eurostoxx50", "country_equity_index", "house_price_index", "energy_index",
@@ -561,31 +563,26 @@ st.caption("Choose the series you want by category. Nothing is selected by defau
 selected_vars = []
 _group_help = {
     "Macro": "Activity, prices, production and labour-market indicators",
-    "Rates & Money": "Policy, money-market and government-bond rates",
+    "Rates & Money": "Policy, sovereign yields and corporate credit spreads",
     "Financial / Other Indexes": "Equity, real-estate and energy price indices",
 }
-# Stack the category cards vertically so every pill is always visible.  In the
-# previous three-column layout the Financial / Other Indexes card could become
-# too narrow on Streamlit Cloud, making later pills (notably the HPI) easy to
-# miss/off-screen.
-for _group_name, _group_vars in variable_groups.items():
+# Three responsive category cards side by side on desktop.
+_cards = st.columns(3, gap="medium")
+for _card, (_group_name, _group_vars) in zip(_cards, variable_groups.items()):
     _opts = [v for v in _group_vars if v in available_vars]
-    with st.container(border=True):
-        st.markdown(f"**{_group_name}**")
-        st.caption(_group_help[_group_name])
-        if _opts:
-            _picked = st.pills(
-                f"{_group_name} series",
-                _opts,
-                default=[],
-                selection_mode="multi",
-                format_func=lambda x: labels.get(x, x.replace("_", " ").title()),
-                key=f"vars_{geography}_{_group_name}",
-                label_visibility="collapsed",
-            )
-            selected_vars.extend(_picked or [])
-        else:
-            st.caption("No series available for this dataset.")
+    with _card:
+        with st.container(border=True):
+            st.markdown(f"#### {_group_name}")
+            st.caption(_group_help[_group_name])
+            if _opts:
+                _picked = st.pills(
+                    f"{_group_name} series", _opts, default=[], selection_mode="multi",
+                    format_func=lambda x: labels.get(x, x.replace("_", " ").title()),
+                    key=f"vars_{geography}_{_group_name}", label_visibility="collapsed",
+                )
+                selected_vars.extend(_picked or [])
+            else:
+                st.caption("No series available for this dataset.")
 
 st.caption(f"{len(selected_vars)} of {len(available_vars)} available series selected.")
 
@@ -610,6 +607,7 @@ if geography=="United States":
     st.caption("US sources: BEA, BLS, Federal Reserve/FRBNY and U.S. Treasury series distributed through FRED. The workbook records the source and series ID beside each variable.")
 else:
     st.caption("European sources: ECB Data Portal, Eurostat, and OECD Financial Market national share-price indices via the direct OECD SDMX API. The app keeps source provenance beside each series.")
+    st.caption("Country-specific HY OAS is not reliably available from ECB/FRED; the country column is blank rather than an EA-wide proxy. EA and US HY OAS use ICE BofA series via FRED.")
     st.caption("EA AAA yields are common fitted AAA curves. Sovereign 10Y is the broad EA convergence yield for EA output and the selected country's own convergence yield in country output.")
 
 
