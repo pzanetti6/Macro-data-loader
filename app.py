@@ -55,7 +55,7 @@ US_LABELS = {
     "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
     "sp500": "S&P 500", "djia": "Dow Jones Industrial Average",
     "hy_spread": "High-yield spread (OAS, last 3 years)",
-    "baa_spread": "Baa-Treasury spread (from 1953)",
+    "corp_spread": "Corporate spread (longest available)",
     "gz_spread": "GZ credit spread (from 1973)",
     "ebp": "Excess bond premium (from 1973)",
 }
@@ -64,7 +64,7 @@ GROUPS = {
         "Macro": ["real_gdp", "real_gdp_growth", "log_real_gdp", "cpi_level",
                   "inflation_rate", "unemployment_rate", "ip", "log_ip"],
         "Rates & money": ["fed_funds", "sofr", "treasury_1y", "treasury_10y",
-                          "baa_spread", "gz_spread", "ebp", "hy_spread"],
+                          "corp_spread", "gz_spread", "ebp", "hy_spread"],
         "Markets & prices": ["sp500", "djia", "house_price_index", "energy_cpi"],
     },
     "EU": {
@@ -718,9 +718,10 @@ high-yield spread exists, so those are not offered.
 **United States.** BEA real GDP (GDPC1), BLS CPI-U (CPIAUCSL) and unemployment (UNRATE), Federal Reserve
 industrial production (INDPRO), federal funds (FEDFUNDS) and Treasury yields (GS1, GS10), FRBNY SOFR, FHFA house
 prices (USSTHPI, from 1975) and ICE BofA high-yield OAS, all through FRED. Since April 2026 FRED publishes only
-the last three years of ICE BofA spreads (US and euro), so for long samples use the Baa-Treasury spread (Moody's,
-monthly from 1953) or the Gilchrist-Zakrajšek credit spread and excess bond premium (Federal Reserve Board, monthly
-from 1973). S&P 500 and Dow Jones come from Yahoo Finance
+the last three years of ICE BofA spreads (US and euro). "Corporate spread (longest available)" compares the
+Moody's Baa-Treasury spread (from 1953), the Gilchrist-Zakrajšek credit spread (Federal Reserve Board, from 1973) and
+the ICE high-yield OAS, and uses the one with the longest sample; its source cell names the series chosen. The three
+are never spliced, because they cover different bonds. S&P 500 and Dow Jones come from Yahoo Finance
 because FRED licenses only their last ten years.
 """)
     if st.button("Clear downloaded data", help="Forget the downloads kept for six hours and fetch fresh copies next time."):

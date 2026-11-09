@@ -69,7 +69,7 @@ US_VARS = [
     "cpi_level", "inflation_rate", "unemployment_rate",
     "ip", "log_ip", "energy_cpi", "house_price_index",
     "fed_funds", "sofr", "treasury_1y", "treasury_10y",
-    "sp500", "djia", "hy_spread", "baa_spread", "gz_spread", "ebp",
+    "sp500", "djia", "corp_spread", "gz_spread", "ebp", "hy_spread",
 ]
 
 SOURCE_URLS = {
@@ -1812,7 +1812,6 @@ _US_DIRECT = {
     "treasury_1y": ("GS1", "Federal Reserve H.15", "M", "1-year Treasury constant-maturity yield, monthly average, percent."),
     "treasury_10y": ("GS10", "Federal Reserve H.15", "M", "10-year Treasury constant-maturity yield, monthly average, percent."),
     "hy_spread": ("BAMLH0A0HYM2", "ICE BofA via FRED", "D", "US high-yield corporate option-adjusted spread, percentage points; averaged over each period. Since April 2026 FRED publishes only the last three years of ICE BofA data (licence restriction)."),
-    "baa_spread": ("BAA10YM", "Moody's via FRED", "M", "Moody's seasoned Baa corporate bond yield minus the 10-year Treasury constant-maturity yield, monthly, percentage points. Starts April 1953."),
 }
 _US_MARKETS = {
     "sp500": ("^GSPC", "SP500", "S&P 500"),
@@ -1825,7 +1824,8 @@ _US_LABELS = {
     "house_price_index": "House price index", "fed_funds": "Federal funds rate", "sofr": "SOFR",
     "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
     "sp500": "S&P 500", "djia": "Dow Jones Industrial Average", "hy_spread": "US high-yield OAS",
-    "baa_spread": "Baa-Treasury spread", "gz_spread": "GZ credit spread", "ebp": "Excess bond premium",
+    "corp_spread": "Corporate spread (longest available)",
+    "gz_spread": "GZ credit spread", "ebp": "Excess bond premium",
 }
 
 FED_EBP_URL = "https://www.federalreserve.gov/econres/notes/feds-notes/ebp_csv.csv"
@@ -1923,8 +1923,11 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     for var, (symbol, fred_id, _label) in _US_MARKETS.items():
         if var in vars_set:
             jobs[var] = (lambda symbol=symbol, fred_id=fred_id: _market_daily(symbol, fred_id, start_year, key))
-    if {"gz_spread", "ebp"} & vars_set:
+    if {"gz_spread", "ebp", "corp_spread"} & vars_set:
         jobs["FED_EBP"] = fed_gz_ebp
+    if "corp_spread" in vars_set:
+        jobs["BAA10YM"] = lambda: fred_series("BAA10YM", key)
+        jobs["BAMLH0A0HYM2"] = lambda: fred_series("BAMLH0A0HYM2", key)
 
     raw: Dict[str, object] = {}
     failed: Dict[str, str] = {}
@@ -2076,6 +2079,39 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
         data[var] = s
         sources[var] = "Federal Reserve Board · ebp_csv.csv"
         meta.append(FetchMeta(label, "Federal Reserve Board", "ebp_csv.csv", "US", "M", _latest(s), note))
+
+    # Corporate spread: whichever candidate covers the longest sample
+    if "corp_spread" in vars_set:
+        candidates = []   # (label, series id, publisher, series at target frequency)
+        if "BAA10YM" in raw:
+            candidates.append(("Moody's Baa minus 10Y Treasury", "BAA10YM", "Moody's via FRED",
+                               _to_frequency(raw["BAA10YM"], freq, "M")))
+        if "FED_EBP" in raw:
+            candidates.append(("Gilchrist-Zakrajsek credit spread", "gz_spread", "Federal Reserve Board",
+                               _to_frequency(raw["FED_EBP"]["gz_spread"], freq, "M")))
+        if "BAMLH0A0HYM2" in raw:
+            candidates.append(("ICE BofA US high-yield OAS", "BAMLH0A0HYM2", "ICE BofA via FRED",
+                               _to_frequency(raw["BAMLH0A0HYM2"], freq, "D")))
+        candidates = [c for c in candidates if not c[3].dropna().empty]
+        if not candidates:
+            reasons = "; ".join(failed.get(k, "") for k in ("BAA10YM", "FED_EBP", "BAMLH0A0HYM2") if failed.get(k))
+            unavailable("corp_spread", "BAA10YM / gz_spread / BAMLH0A0HYM2", reasons or "no candidate returned data")
+        else:
+            def span(c):
+                x = c[3].dropna()
+                return (x.index.max().ordinal - x.index.min().ordinal, x.index.max().ordinal)
+            best = max(candidates, key=span)
+            label, sid, publisher, s = best
+            data["corp_spread"] = s
+            sources["corp_spread"] = f"{label} ({publisher} · {sid}), longest available"
+            spans = "; ".join(f"{c[0]}: {c[3].dropna().index.min()} to {c[3].dropna().index.max()}"
+                              for c in sorted(candidates, key=span, reverse=True))
+            meta.append(FetchMeta("Corporate spread", publisher, sid, "US", "M" if sid != "BAMLH0A0HYM2" else "D",
+                                  _latest(s),
+                                  f"Longest available corporate spread, percentage points; selected: {label}. "
+                                  f"Candidates compared: {spans}. The candidates measure different bond "
+                                  "universes (Baa-rated, all senior unsecured, high-yield), so only one is used, "
+                                  "never spliced."))
 
     # Equity indices
     for var, (symbol, fred_id, label) in _US_MARKETS.items():

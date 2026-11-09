@@ -34,7 +34,7 @@ ALIASES = {
     "hy_spread": ["hy_spread", "high_yield_spread", "corporate_hy_spread", "hy_oas"],
     "country_equity_index": ["country_equity_index", "equity_index", "share_price_index"],
     "sp500": ["sp500", "s&p500", "s_p_500"],
-    "baa_spread": ["baa_spread", "baa10y", "baa_treasury_spread"],
+    "corp_spread": ["corp_spread", "corporate_spread", "credit_spread", "baa_spread"],
     "gz_spread": ["gz_spread", "gz"],
     "ebp": ["ebp", "excess_bond_premium"],
     "djia": ["djia", "dow_jones", "dow_jones_industrial_average"],

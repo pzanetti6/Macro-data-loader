@@ -66,7 +66,7 @@ Do not copy or commit `.venv`: a virtual environment only works on the machine a
 
 - **Euro area:** ECB Data Portal and Eurostat (HICP, unemployment, industrial production, GDP, house prices); where both publish an equivalent series the longest and most recent is chosen. OECD harmonised share-price indices for national equity markets. ICE BofA Euro High Yield OAS via FRED.
 - **United States:** BEA (GDPC1), BLS (CPIAUCSL, UNRATE, CPIENGSL), Federal Reserve (INDPRO, FEDFUNDS, GS1, GS10), FRBNY (SOFR), FHFA (USSTHPI, from 1975Q1) and ICE BofA (BAMLH0A0HYM2), all through FRED. Moody's Baa–10Y Treasury spread (BAA10YM, from 1953) via FRED, and the Gilchrist–Zakrajšek credit spread and excess bond premium (from 1973) directly from the Federal Reserve Board.
-- **Corporate spreads and history:** since April 2026 FRED publishes only the last three years of every ICE BofA series (US and euro high-yield OAS), because of ICE's licence. Use the Baa–Treasury spread or the GZ spread / EBP for long samples. S&P 500 and Dow Jones from Yahoo Finance, because FRED licenses only their last ten years; if Yahoo is unreachable the FRED ten-year series is used and labelled as such.
+- **Corporate spreads and history:** since April 2026 FRED publishes only the last three years of every ICE BofA series (US and euro high-yield OAS), because of ICE's licence. The US "Corporate spread (longest available)" picks the longest of Baa–Treasury, GZ spread and ICE OAS automatically. S&P 500 and Dow Jones from Yahoo Finance, because FRED licenses only their last ten years; if Yahoo is unreachable the FRED ten-year series is used and labelled as such.
 
 ## How FRED is reached
 
@@ -93,8 +93,8 @@ Requests are spaced to respect FRED's rate limit, retried on 429/5xx errors, and
 
 ## Changelog
 
-### v25.1
-- Added long-history US corporate spreads: Baa–10Y Treasury (Moody's, from 1953), GZ credit spread and excess bond premium (Federal Reserve Board, from 1973).
+### v25.2
+- New "Corporate spread (longest available)" for the US: compares Moody's Baa–10Y Treasury (from 1953), the Gilchrist–Zakrajšek credit spread (Federal Reserve Board, from 1973) and the ICE high-yield OAS, and uses the one with the longest sample (never spliced). GZ spread and excess bond premium are also available on their own.
 - High-yield OAS is labelled "last 3 years": FRED truncated all ICE BofA series to a rolling three-year window in April 2026.
 
 ### v25
