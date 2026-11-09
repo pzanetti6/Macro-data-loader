@@ -12,7 +12,13 @@ import pandas as pd
 import streamlit as st
 
 from macro_core import (CANONICAL_VARS, US_VARS, COUNTRY_NAMES, EA19, DataError,
-                        fetch_country_panel, fetch_macro_dataset, fetch_us_dataset_fast)
+                        fetch_country_panel, fetch_macro_dataset, fetch_us_dataset)
+# Compatible with deployments where app.py and macro_core.py update at different times.
+try:
+    from macro_core import fetch_us_dataset_fast
+except ImportError:
+    fetch_us_dataset_fast = fetch_us_dataset
+
 from excel_tools import create_workbook, update_workbook, workbook_sheet_names
 
 # User-facing reference names for national equity series. Kept local to the UI so
