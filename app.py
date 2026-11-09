@@ -1,954 +1,721 @@
 from __future__ import annotations
 
-import io
-import re
-from datetime import date, datetime
+import inspect
+from datetime import date
 
 import numpy as np
-from openpyxl import load_workbook
-from openpyxl.utils.datetime import to_excel
-
 import pandas as pd
 import streamlit as st
 
-from macro_core import (CANONICAL_VARS, US_VARS, COUNTRY_NAMES, EA19, DataError,
-                        fetch_country_panel, fetch_macro_dataset, fetch_us_dataset, configure_fred_api_key)
-# Compatible with deployments where app.py and macro_core.py update at different times.
+import macro_core as mc
+from macro_core import (CANONICAL_VARS, COUNTRY_NAMES, EA19, US_VARS, DataError,
+                        fetch_country_panel, fetch_macro_dataset, fetch_us_dataset)
+from excel_tools import create_workbook, frequency_of_sheet, update_workbook, workbook_sheet_names
+
 try:
-    from macro_core import fetch_us_dataset_fast
-except ImportError:
-    fetch_us_dataset_fast = fetch_us_dataset
+    from macro_core import REFERENCE_EQUITY_INDEX
+except ImportError:  # older macro_core
+    REFERENCE_EQUITY_INDEX = {}
 
-from excel_tools import create_workbook, update_workbook, workbook_sheet_names
+# Public edition: monetary-policy shock upload is not exposed. A private build can
+# collect uploads and call shock_tools.integrate_shocks(datasets, previews, freq).
+SHOCK_PREVIEWS: list = []
 
-# User-facing reference names for national equity series. Kept local to the UI so
-# startup does not depend on a display-only constant exported by macro_core.
-REFERENCE_EQUITY_INDEX = {
-    "AT": "ATX", "BE": "BEL 20", "CY": "Cyprus General Index", "DE": "DAX",
-    "EE": "OMX Tallinn", "EL": "Athens General Composite", "ES": "IBEX 35",
-    "FI": "OMX Helsinki 25", "FR": "CAC 40", "IE": "ISEQ Overall",
-    "IT": "FTSE MIB", "LT": "OMX Vilnius", "LU": "LuxX", "LV": "OMX Riga",
-    "MT": "Malta Stock Exchange Index", "NL": "AEX", "PT": "PSI",
-    "SI": "SBI TOP", "SK": "SAX",
+# ---------------------------------------------------------------------------
+# Vocabulary
+# ---------------------------------------------------------------------------
+
+FREQUENCIES = {"Monthly": "M", "Quarterly": "Q", "Annual": "A"}
+FREQ_WORD = {"M": "monthly", "Q": "quarterly", "A": "annual"}
+GDP_METHODS = [
+    "Chow-Lin (industrial production)",
+    "Linear interpolation",
+    "Quarterly step (repeat within quarter)",
+    "Leave blank",
+]
+GEOGRAPHIES = ["Euro area", "Euro-area countries", "United States"]
+
+EU_LABELS = {
+    "real_gdp": "Real GDP", "real_gdp_growth": "Real GDP growth", "log_real_gdp": "Log real GDP",
+    "hicp_level": "HICP level", "hicp_rate": "HICP inflation", "unemployment_rate": "Unemployment rate",
+    "ip": "Industrial production", "log_ip": "Log industrial production", "energy_index": "Energy prices (HICP)",
+    "house_price_index": "House prices",
+    "estr": "€STR", "dfr": "Deposit facility rate", "mro": "Main refinancing rate",
+    "aaa_1y": "AAA 1Y yield", "aaa_10y": "AAA 10Y yield",
+    "sovereign_1y": "Sovereign 1Y yield", "sovereign_10y": "Sovereign 10Y yield",
+    "eurostoxx50": "EURO STOXX 50", "country_equity_index": "National equity index",
+    "hy_spread": "High-yield spread (OAS)",
+}
+US_LABELS = {
+    "real_gdp": "Real GDP", "real_gdp_growth": "Real GDP growth", "log_real_gdp": "Log real GDP",
+    "cpi_level": "CPI level", "inflation_rate": "CPI inflation", "unemployment_rate": "Unemployment rate",
+    "ip": "Industrial production", "log_ip": "Log industrial production", "energy_cpi": "Energy prices (CPI)",
+    "house_price_index": "House prices",
+    "fed_funds": "Federal funds rate", "sofr": "SOFR",
+    "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
+    "sp500": "S&P 500", "djia": "Dow Jones Industrial Average",
+    "hy_spread": "High-yield spread (OAS)",
+}
+GROUPS = {
+    "US": {
+        "Macro": ["real_gdp", "real_gdp_growth", "log_real_gdp", "cpi_level",
+                  "inflation_rate", "unemployment_rate", "ip", "log_ip"],
+        "Rates & money": ["fed_funds", "sofr", "treasury_1y", "treasury_10y", "hy_spread"],
+        "Markets & prices": ["sp500", "djia", "house_price_index", "energy_cpi"],
+    },
+    "EU": {
+        "Macro": ["real_gdp", "real_gdp_growth", "log_real_gdp", "hicp_level",
+                  "hicp_rate", "unemployment_rate", "ip", "log_ip"],
+        "Rates & money": ["estr", "dfr", "mro", "aaa_1y", "aaa_10y",
+                          "sovereign_1y", "sovereign_10y", "hy_spread"],
+        "Markets & prices": ["eurostoxx50", "country_equity_index", "house_price_index", "energy_index"],
+    },
+}
+GROUP_HELP = {
+    "Macro": "Output, prices, labour market and production.",
+    "Rates & money": "Policy rates, money-market rates, government yields and credit spreads.",
+    "Markets & prices": "Equity indices, house prices and energy prices.",
+}
+
+# How each series is built, keyed by the normalised meta label.
+CONSTRUCTION = {
+    "real_gdp_growth": "Simple year-on-year % change of real GDP (12 months, 4 quarters or 1 year).",
+    "log_real_gdp": "Natural log of real GDP.",
+    "hicp_level": "All-items HICP index; monthly values averaged to the output frequency.",
+    "hicp_rate": "Published HICP annual rate of change (y/y %). Quarterly and annual values average the monthly rates.",
+    "cpi": "CPI-U, seasonally adjusted. Inflation is the 12-month % change; quarterly and annual values average the monthly rates.",
+    "unemployment_rate": "Seasonally adjusted unemployment rate; monthly values averaged to the output frequency.",
+    "industrial_production": "Industrial production index, seasonally adjusted; monthly values averaged. Log IP is the log of that average.",
+    "energy_hicp": "HICP energy aggregate; monthly values averaged to the output frequency.",
+    "energy_cpi": "CPI-U energy; monthly values averaged to the output frequency.",
+    "house_price_index": "Native quarterly. Monthly output repeats each quarter's value; annual output averages quarters.",
+    "dfr": "Rate in force on each day (carried forward between ECB decisions, up to today), averaged over the period.",
+    "mro": "Rate in force on each day (carried forward between ECB decisions, up to today), averaged over the period.",
+    "estr": "Daily €STR averaged over the period.",
+    "aaa_1y": "ECB AAA euro-area government curve, 1Y spot rate; daily values averaged over the period.",
+    "aaa_10y": "ECB AAA euro-area government curve, 10Y spot rate; daily values averaged over the period.",
+    "ea_sovereign/convergence_10y_yield": "ECB long-term interest rate for convergence purposes (10Y), monthly; averaged for quarterly/annual output.",
+    "country_sovereign_10y_yield": "ECB long-term interest rate for convergence purposes (10Y), monthly; averaged for quarterly/annual output.",
+    "euro_stoxx_50": "ECB monthly EURO STOXX 50 (average of daily closes); averaged further for quarterly/annual output.",
+    "euro_high-yield_oas": "ICE BofA Euro High Yield OAS via FRED; daily values averaged over the period.",
 }
 
 
-SHOCK_SHEET_BY_FREQ = {"M": "monthly_freq", "Q": "quarterly_freq", "A": "annual_freq"}
-
-def _shock_period_key(v, freq: str):
-    """
-    Normalize heterogeneous shock dates to the selected macro frequency.
-
-    Important rule: slash-formatted dates such as 01/03/99 are interpreted
-    day-first (DD/MM/YY), which is the convention used in the supplied European
-    shock workbooks. Thus 01/03/99 -> 1999-03, not 1999-01.
-    """
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        raise ValueError("blank date")
-
-    def _from_timestamp(d):
-        d = pd.Timestamp(d)
-        if freq == "A":
-            return f"{d.year:04d}"
-        if freq == "Q":
-            return f"{d.year:04d}q{((d.month - 1)//3)+1}"
-        return f"{d.year:04d}-{d.month:02d}"
-
-    # Excel/openpyxl dates arrive as datetime objects: never stringify/reparse them.
-    if isinstance(v, (datetime, pd.Timestamp)):
-        return _from_timestamp(v)
-
-    # Excel serial date fallback.
-    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
-        # Four-digit year cells are valid annual dates.
-        if freq == "A" and 1900 <= int(v) <= 2100 and float(v).is_integer():
-            return f"{int(v):04d}"
-        d = pd.Timestamp("1899-12-30") + pd.to_timedelta(float(v), unit="D")
-        return _from_timestamp(d)
-
-    s = str(v).strip()
-    if not s:
-        raise ValueError("blank date")
-
-    # Explicit annual representation.
-    if freq == "A" and re.fullmatch(r"(?:19|20)\d{2}(?:\.0)?", s):
-        return s[:4]
-
-    # Explicit quarter representations: 2024Q1, 2024-Q1, Q1 2024, etc.
+def gdp_construction(freq: str, method: str) -> str:
     if freq == "Q":
-        compact = re.sub(r"[\s_\-/.]", "", s).upper()
-        m = re.fullmatch(r"((?:19|20)\d{2})Q([1-4])", compact)
-        if m:
-            return f"{m.group(1)}q{m.group(2)}"
-        m = re.fullmatch(r"Q([1-4])((?:19|20)\d{2})", compact)
-        if m:
-            return f"{m.group(2)}q{m.group(1)}"
-
-    # Explicit year-month forms are unambiguous.
-    ym = re.fullmatch(r"((?:19|20)\d{2})[-/._](0?[1-9]|1[0-2])", s)
-    if ym:
-        d = pd.Timestamp(year=int(ym.group(1)), month=int(ym.group(2)), day=1)
-        return _from_timestamp(d)
-    ym2 = re.fullmatch(r"((?:19|20)\d{2})(0[1-9]|1[0-2])", s)
-    if ym2:
-        d = pd.Timestamp(year=int(ym2.group(1)), month=int(ym2.group(2)), day=1)
-        return _from_timestamp(d)
-
-    # European slash/dash full dates: DD/MM/YYYY or DD/MM/YY.
-    # This specifically fixes 01/mm/yy shock sheets.
-    if re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", s):
-        try:
-            return _from_timestamp(pd.to_datetime(s, dayfirst=True, errors="raise"))
-        except Exception:
-            pass
-
-    # ISO-like full dates YYYY-MM-DD / YYYY/MM/DD.
-    if re.fullmatch(r"(?:19|20)\d{2}[/-]\d{1,2}[/-]\d{1,2}", s):
-        try:
-            return _from_timestamp(pd.to_datetime(s, yearfirst=True, errors="raise"))
-        except Exception:
-            pass
-
-    # Month-name and other textual dates. Prefer European day-first interpretation.
-    try:
-        return _from_timestamp(pd.to_datetime(s, dayfirst=True, errors="raise"))
-    except Exception:
-        raise ValueError(f"'{v}' cannot be interpreted as a { {'M':'monthly','Q':'quarterly','A':'annual'}[freq] } date")
+        return "Published quarterly real GDP (chain-linked volumes)."
+    if freq == "A":
+        return "Average of the four published quarterly levels."
+    if method.startswith("Chow-Lin"):
+        return ("Chow-Lin (maximum likelihood) disaggregation with industrial production and a trend as "
+                "indicators; each quarter's three months average exactly to the published quarter.")
+    if method.startswith("Linear"):
+        return "Quarterly level placed on the quarter's middle month and interpolated linearly."
+    if method.startswith("Quarterly step"):
+        return "Each quarter's published level repeated for its three months."
+    return "Left blank: GDP is not published monthly."
 
 
-def _macro_period_key(v, freq: str):
-    """Return canonical output dates: YYYY-MM, YYYYqQ, or YYYY."""
-    if isinstance(v, pd.Period):
-        if freq == "A":
-            return f"{v.year:04d}"
-        if freq == "Q":
-            return f"{v.year:04d}q{v.quarter}"
-        return f"{v.year:04d}-{v.month:02d}"
-    if isinstance(v, (datetime, pd.Timestamp)):
-        if freq == "A":
-            return f"{v.year:04d}"
-        if freq == "Q":
-            return f"{v.year:04d}q{((v.month-1)//3)+1}"
-        return f"{v.year:04d}-{v.month:02d}"
-    return _shock_period_key(v, freq)
+def _norm(label) -> str:
+    return str(label or "").strip().lower().replace(" ", "_")
 
-def _canonicalize_dataset_dates(datasets, freq: str):
-    """Force the final Excel date column into one Stata-friendly text convention."""
-    out={}
+
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
+
+def canonical_label(v, freq: str):
+    p = mc.label_to_period(v, freq)
+    if p is None:
+        return v
+    if freq == "A":
+        return f"{p.year:04d}"
+    if freq == "Q":
+        return f"{p.year:04d}q{p.quarter}"
+    return f"{p.year:04d}-{p.month:02d}"
+
+
+def finalize(datasets: dict, freq: str, start: date, end: date) -> dict:
+    """Restrict to the chosen window, drop empty edges and write one date style."""
+    out = {}
     for geo, df in datasets.items():
-        x=df.copy()
-        date_col="date" if "date" in x.columns else ("period" if "period" in x.columns else x.columns[0])
-        x[date_col]=x[date_col].map(lambda v:_macro_period_key(v,freq))
-        out[geo]=x
+        x = mc.trim_to_window(df, freq, start, end)
+        x = x.copy()
+        x["date"] = x["date"].map(lambda v: canonical_label(v, freq))
+        out[geo] = x
     return out
 
 
-def _read_shock_sheet(file_bytes: bytes, freq: str):
-    """
-    Read the requested frequency sheet. If it is absent but a meeting-level
-    sheet exists, aggregate meeting shocks by SUM into the requested frequency.
-    """
-    wanted = SHOCK_SHEET_BY_FREQ[freq]
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-
-    # Accept common sheet-name variants, case-insensitively.
-    # Examples: monthly_freq, monthly, month; quarterly_freq, quarterly, quarter;
-    # annual_freq, annual, yearly, year.
-    aliases = {
-        "M": ["monthly_freq", "monthly", "month", "monthly frequency", "monthly-frequency"],
-        "Q": ["quarterly_freq", "quarterly", "quarter", "quarterly frequency", "quarterly-frequency"],
-        "A": ["annual_freq", "annual", "yearly", "year", "annual frequency", "annual-frequency"],
-    }
-    def _norm_sheet_name(s):
-        return re.sub(r"[^a-z0-9]+", "_", str(s).strip().lower()).strip("_")
-
-    normalized_sheets = {_norm_sheet_name(s): s for s in wb.sheetnames}
-    matched_sheet = None
-    for alias in aliases[freq]:
-        key = _norm_sheet_name(alias)
-        if key in normalized_sheets:
-            matched_sheet = normalized_sheets[key]
-            break
-
-    def _sheet_to_df(ws):
-        rows = list(ws.iter_rows(values_only=True))
-        if len(rows) < 2:
-            raise DataError(f"Shock sheet '{ws.title}' is empty.")
-        headers = [str(x).strip() if x is not None else "" for x in rows[0]]
-        date_candidates = [
-            i for i,h in enumerate(headers)
-            if h.lower() in ("date","meetingdate","meeting_date","year","period","quarter","month")
-        ]
-        date_idx = date_candidates[0] if date_candidates else 0
-        if not headers[date_idx]:
-            headers[date_idx] = "date"
-        data = pd.DataFrame(rows[1:], columns=headers).dropna(how="all")
-        return data, headers[date_idx]
-
-    if matched_sheet is not None:
-        data, date_col = _sheet_to_df(wb[matched_sheet])
-        return data, date_col, matched_sheet
-
-    # Flexible fallback for raw meeting-level shock workbooks.
-    meeting_aliases = {"meeting", "meetings", "meeting_freq", "meeting_level", "meeting_frequency"}
-    meeting_names = [s for s in wb.sheetnames if _norm_sheet_name(s) in meeting_aliases]
-    if not meeting_names:
-        raise DataError(
-            f"Shock workbook has no recognized { {'M':'monthly','Q':'quarterly','A':'annual'}[freq] } sheet "
-            f"(accepted examples: {', '.join(aliases[freq])}) and no meeting-level sheet from which "
-            "the requested frequency can be constructed."
-        )
-
-    meeting_name = meeting_names[0]
-    raw, date_col = _sheet_to_df(wb[meeting_name])
-
-    # Convert meeting dates flexibly. Excel/openpyxl normally gives datetime objects;
-    # text dates are handled by pandas.
-    parsed_dates = []
-    bad_dates = []
-    for v in raw[date_col].tolist():
-        try:
-            if isinstance(v, (datetime, pd.Timestamp)):
-                d = pd.Timestamp(v)
-            elif isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
-                # Excel serial date fallback.
-                d = pd.Timestamp("1899-12-30") + pd.to_timedelta(float(v), unit="D")
-            else:
-                d = pd.to_datetime(str(v).strip(), errors="raise")
-            parsed_dates.append(d)
-        except Exception:
-            parsed_dates.append(pd.NaT)
-            bad_dates.append(str(v))
-    if bad_dates:
-        raise DataError(
-            f"Could not interpret meeting dates in '{meeting_name}'. Examples: "
-            + ", ".join(bad_dates[:3])
-        )
-
-    # Identify usable value columns. Metadata such as Year/Month/source/rates are not
-    # treated as shocks by default; shock/surprise-named columns are preferred.
-    candidate_cols = [c for c in raw.columns if c != date_col and str(c).strip()]
-    preferred = [
-        c for c in candidate_cols
-        if any(k in str(c).lower() for k in ("shock","surprise"))
-    ]
-    value_cols = preferred if preferred else candidate_cols
-
-    converted = {}
-    for c in value_cols:
-        vals = raw[c].map(_shock_numeric)
-        # Keep a column only if every nonblank observation is numeric and at least one exists.
-        bad = raw[c].notna() & vals.isna()
-        if not bad.any() and vals.notna().any():
-            converted[c] = vals.astype(float)
-    if not converted:
-        raise DataError(
-            f"No numeric shock/surprise columns could be identified in meeting-level sheet '{meeting_name}'."
-        )
-
-    temp = pd.DataFrame({"_meeting_date": parsed_dates, **converted})
-    if freq == "M":
-        temp["date"] = temp["_meeting_date"].map(lambda d: f"{d.year:04d}-{d.month:02d}")
-    elif freq == "Q":
-        temp["date"] = temp["_meeting_date"].map(lambda d: f"{d.year:04d}q{((d.month-1)//3)+1}")
-    else:
-        temp["date"] = temp["_meeting_date"].map(lambda d: f"{d.year:04d}")
-
-    # Monetary-policy meeting shocks aggregate by summation within the lower frequency.
-    agg = temp.groupby("date", as_index=False)[list(converted.keys())].sum(min_count=1)
-    return agg, "date", f"{meeting_name} → derived {wanted}"
+def value_columns(df: pd.DataFrame) -> list:
+    return [c for c in df.columns
+            if c not in ("date", "country", "period") and not str(c).endswith("_source")
+            and pd.api.types.is_numeric_dtype(df[c])]
 
 
-def _shock_numeric(v):
-    """Recover numeric shock values even when Excel mistakenly formats them as dates/times."""
-    if v is None:
-        return np.nan
-    if isinstance(v, (datetime, pd.Timestamp)):
-        return float(to_excel(v))
-    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
-        return float(v)
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return np.nan
-
-def _validate_and_prepare_shocks(file_bytes: bytes, freq: str, value_columns, macro_dates):
-    raw, date_col, sheet = _read_shock_sheet(file_bytes, freq)
-    if not value_columns:
-        raise DataError("Select at least one shock series from the uploaded shock workbook.")
-
-    keys=[]
-    bad_dates=[]
-    for v in raw[date_col].tolist():
-        try:
-            keys.append(_shock_period_key(v, freq))
-        except Exception as exc:
-            keys.append(None)
-            bad_dates.append(str(exc))
-    if bad_dates:
-        sample="; ".join(bad_dates[:3])
-        raise DataError(f"Shock dates do not match the selected {freq} frequency. {sample}")
-
-    out=pd.DataFrame({"_period_key":keys})
-    if out["_period_key"].duplicated().any():
-        dups=out.loc[out["_period_key"].duplicated(False),"_period_key"].unique()[:5]
-        raise DataError(
-            "Shock file contains duplicate periods after date normalization: "
-            + ", ".join(map(str, dups))
-            + ". Check whether the source really has multiple observations in the same period."
-        )
-
-    for c in value_columns:
-        if c == date_col or c not in raw.columns:
-            continue
-        vals=raw[c].map(_shock_numeric)
-        bad=raw[c].notna() & vals.isna()
-        if bad.any():
-            examples=", ".join(map(str, raw.loc[bad,c].head(3).tolist()))
-            raise DataError(f"Shock column '{c}' contains non-numeric values: {examples}")
-        out[c]=vals.astype(float)
-
-    macro_keys=[_macro_period_key(v,freq) for v in macro_dates]
-    macro_set=set(macro_keys)
-    shock_set=set(out["_period_key"].dropna())
-    outside=sorted(shock_set-macro_set)
-    if outside:
-        sample=", ".join(outside[:6])
-        raise DataError(
-            f"Shock dates do not align with the selected macro sample ({macro_keys[0]} to {macro_keys[-1]}). "
-            f"Outside dates include: {sample}"
-        )
-
-    # Partial coverage is legitimate (e.g. a shock series ending before the macro data).
-    aligned=pd.DataFrame({"_period_key":macro_keys}).merge(out,on="_period_key",how="left")
-
-    # GPT/ChatGPT meeting shocks are defined as zero in periods with no meeting.
-    # Fill only BETWEEN the first and last observed period of that uploaded
-    # series; do not invent zeros before the series begins or after it ends.
-    shock_period_order = {k:i for i,k in enumerate(macro_keys)}
-    observed_keys = [k for k in out["_period_key"].dropna() if k in shock_period_order]
-    if observed_keys:
-        lo = min(shock_period_order[k] for k in observed_keys)
-        hi = max(shock_period_order[k] for k in observed_keys)
-        inside = aligned.index.to_series().between(lo, hi)
-        for c in value_columns:
-            cname = str(c).lower().replace("_","").replace("-","")
-            if c in aligned.columns and ("gpt" in cname or "chatgpt" in cname):
-                aligned.loc[inside & aligned[c].isna(), c] = 0.0
-
-    coverage={c:int(aligned[c].notna().sum()) for c in value_columns if c in aligned.columns}
-    return aligned, coverage, sheet
-
-def _attach_shocks(datasets, shock_aligned, shock_columns, freq):
-    result={}
-    for geo,df in datasets.items():
-        x=df.copy()
-        date_col="date" if "date" in x.columns else ("period" if "period" in x.columns else x.columns[0])
-        x["_period_key"]=x[date_col].map(lambda v:_macro_period_key(v,freq))
-        add=shock_aligned[["_period_key"]+[c for c in shock_columns if c in shock_aligned.columns]]
-        x=x.merge(add,on="_period_key",how="left").drop(columns="_period_key")
-        result[geo]=x
-    return result
+def time_index(labels, freq: str) -> pd.DatetimeIndex:
+    stamps = []
+    for v in labels:
+        p = mc.label_to_period(v, freq)
+        stamps.append(p.to_timestamp() if p is not None else pd.NaT)
+    return pd.DatetimeIndex(stamps)
 
 
-def _run_dataset_diagnostics(df: pd.DataFrame, freq: str):
-    """Detect missing values, suspicious zeros, duplicates and robust outliers."""
-    issues={"missing":[],"zeros":[],"outliers":[],"duplicates":[]}
+def meta_rows(meta, freq: str, method: str) -> list:
+    rows = []
+    for m in meta:
+        d = m.__dict__ if hasattr(m, "__dict__") else dict(m)
+        key = _norm(d.get("variable"))
+        if key == "real_gdp":
+            how = gdp_construction(freq, method)
+        else:
+            how = CONSTRUCTION.get(key) or d.get("note") or "Downloaded directly; averaged to the output frequency where needed."
+        rows.append({
+            "series": d.get("variable"),
+            "source": d.get("source"),
+            "series_id": d.get("dataset"),
+            "geography": d.get("geography"),
+            "native_frequency": d.get("native_frequency"),
+            "latest_observation": d.get("latest_period"),
+            "construction": how,
+            "note": d.get("note", ""),
+        })
+    return rows
+
+
+_RATE_LIKE = ("rate", "growth", "inflation", "spread", "yield", "dfr", "mro", "estr", "sofr",
+              "fed_funds", "treasury", "aaa", "sovereign", "shock", "gpt", "rr_", "jk_")
+
+
+def _rate_like(name: str) -> bool:
+    n = str(name).lower()
+    return any(k in n for k in _RATE_LIKE)
+
+
+def run_checks(df: pd.DataFrame, freq: str) -> list:
+    """Return (kind, message) pairs: duplicates, interior gaps, odd zeros, extreme jumps."""
+    out = []
     if df is None or df.empty:
-        return issues
-    date_col="date" if "date" in df.columns else ("period" if "period" in df.columns else df.columns[0])
-    dates=df[date_col].astype(str)
-    dup=dates[dates.duplicated(keep=False)].unique().tolist()
+        return [("warning", "No rows in the selected window.")]
+    dates = df["date"].astype(str).reset_index(drop=True)
+    dup = dates[dates.duplicated(keep=False)].unique().tolist()
     if dup:
-        issues["duplicates"]=dup[:12]
+        out.append(("error", "Duplicate dates: " + ", ".join(dup[:8]) + "."))
+    gaps, zeros, jumps, empty = [], [], [], []
+    for c in value_columns(df):
+        s = pd.to_numeric(df[c], errors="coerce").reset_index(drop=True)
+        valid = s.notna().to_numpy()
+        if not valid.any():
+            empty.append(c)
+            continue
+        first, last = int(np.argmax(valid)), len(valid) - 1 - int(np.argmax(valid[::-1]))
+        inner = s.iloc[first:last + 1]
+        miss = inner.isna()
+        if miss.any():
+            gaps.append(f"{c}: {int(miss.sum())} ({', '.join(dates[inner.index[miss]][:3])})")
+        rate_like = _rate_like(c)
+        if not rate_like and inner.eq(0).any():
+            zeros.append(f"{c} ({', '.join(dates[inner.index[inner.eq(0)]][:3])})")
+        x = inner.dropna()
+        if not rate_like and (x > 0).all():
+            x = np.log(x)
+        d = x.diff().dropna()
+        if len(d) >= 24:
+            med = float(d.median())
+            mad = float((d - med).abs().median())
+            if mad > 0:
+                rz = 0.6745 * (d - med) / mad
+                big = rz[rz.abs() > 8]
+                if not big.empty:
+                    top = big.abs().sort_values(ascending=False).index[:3]
+                    jumps.append(f"{c}: " + ", ".join(f"{dates[i]} (robust z {rz[i]:.0f})" for i in top))
+    if empty:
+        out.append(("warning", "No observations in this window for: " + ", ".join(empty) + "."))
+    if gaps:
+        out.append(("warning", "Missing values inside the sample: " + "; ".join(gaps[:8]) + "."))
+    if zeros:
+        out.append(("warning", "Exact zeros in level series, usually a placeholder for missing data: "
+                    + "; ".join(zeros[:6]) + "."))
+    if jumps:
+        out.append(("info", "Unusually large period-to-period changes (check, they may be genuine, e.g. 2020): "
+                    + "; ".join(jumps[:6]) + "."))
+    last_p = mc.label_to_period(dates.iloc[-1], freq)
+    if last_p is not None and last_p == pd.Period(date.today(), freq={"M": "M", "Q": "Q", "A": "Y"}[freq]):
+        out.append(("info", f"The last period ({dates.iloc[-1]}) is still in progress: averages of daily "
+                    "series cover the days published so far."))
+    return out
 
-    numeric_cols=[]
-    for c in df.columns:
-        if c==date_col or str(c).endswith("_source"): continue
-        s=pd.to_numeric(df[c],errors="coerce")
-        if s.notna().any(): numeric_cols.append((c,s))
 
-    for c,s in numeric_cols:
-        nmiss=int(s.isna().sum())
-        if nmiss:
-            miss_dates=dates[s.isna()].tolist()
-            issues["missing"].append((c,nmiss,miss_dates[:4]))
-        # Flag zeros only when zeros are unusual for that series; shock columns are exempt
-        # because non-meeting zeros are economically meaningful.
-        cname=str(c).lower()
-        nz=s.dropna()
-        zmask=s.eq(0)
-        if zmask.any() and not any(k in cname for k in ("shock","gpt","rr_","jk_")):
-            zero_share=float(zmask.sum()/max(s.notna().sum(),1))
-            if zero_share < .20 and (nz.abs().median() if not nz.empty else 0) > 1e-10:
-                issues["zeros"].append((c,int(zmask.sum()),dates[zmask].tolist()[:4]))
-        # Robust MAD outlier rule; report only very extreme observations.
-        valid=s.dropna()
-        if len(valid)>=12:
-            med=float(valid.median())
-            mad=float((valid-med).abs().median())
-            if mad>0:
-                rz=0.6745*(s-med)/mad
-                omask=rz.abs()>6
-                if omask.any():
-                    vals=[(dates.iloc[i],float(s.iloc[i]),float(rz.iloc[i])) for i in range(len(s)) if bool(omask.iloc[i])]
-                    issues["outliers"].append((c,vals[:5]))
-    return issues
+def chart_frame(df: pd.DataFrame, cols: list, freq: str, scale: str):
+    x = df[["date"] + cols].copy()
+    x.index = time_index(x["date"], freq)
+    x = x[cols].apply(pd.to_numeric, errors="coerce")
+    x = x[~x.index.isna()]
+    skipped = []
+    if scale == "Index, first common period = 100" and cols:
+        common = x.dropna()
+        if common.empty:
+            return x.iloc[0:0], cols
+        base = common.iloc[0]
+        keep = [c for c in cols if base[c] > 0]
+        skipped = [c for c in cols if c not in keep]
+        x = x[keep].div(base[keep]).mul(100.0)
+    elif scale == "Standardised (z-score)":
+        x = (x - x.mean()) / x.std(ddof=0)
+    return x, skipped
 
-def _show_diagnostics(datasets, freq):
-    st.subheader("Data diagnostics")
-    total=sum(len(v) for v in datasets.values())
-    st.caption(f"Automated checks across {len(datasets)} dataset(s) and {total:,} rows.")
-    any_issue=False
-    for geo,df in datasets.items():
-        d=_run_dataset_diagnostics(df,freq)
-        if d["duplicates"]:
-            any_issue=True
-            st.error(f"{geo}: duplicate dates detected — {', '.join(d['duplicates'])}.")
-        if d["missing"]:
-            any_issue=True
-            examples="; ".join(f"{c}: {n} missing ({', '.join(ds)})" for c,n,ds in d["missing"][:6])
-            st.warning(f"{geo}: missing observations detected. {examples}")
-        if d["zeros"]:
-            any_issue=True
-            examples="; ".join(f"{c}: {n} unusual zero(s) ({', '.join(ds)})" for c,n,ds in d["zeros"][:6])
-            st.warning(f"{geo}: suspicious isolated zeros detected. {examples}")
-        if d["outliers"]:
-            any_issue=True
-            parts=[]
-            for c,vals in d["outliers"][:5]:
-                vv=", ".join(f"{dt}={val:.3g} (robust z {z:.1f})" for dt,val,z in vals[:3])
-                parts.append(f"{c}: {vv}")
-            st.info(f"{geo}: potential extreme outliers — " + "; ".join(parts))
-    if not any_issue:
-        st.success("Diagnostics passed: no missing values, suspicious isolated zeros, duplicate dates or extreme robust outliers detected.")
 
-st.set_page_config(page_title="Macro Data Loader", page_icon="🌐", layout="wide")
+def secret_fred_key() -> str:
+    try:
+        return str(st.secrets.get("FRED_API_KEY", "") or "")
+    except Exception:
+        return ""
 
-st.markdown("""
+
+_SEG_PARAMS = set(inspect.signature(st.segmented_control).parameters)
+_PILL_PARAMS = set(inspect.signature(st.pills).parameters)
+
+
+def segmented(label, options, default, key, **kw):
+    """Single-choice segmented control that always returns a value and wraps if narrow."""
+    if "required" in _SEG_PARAMS:
+        kw["required"] = True
+    if "wrap" in _SEG_PARAMS:
+        kw["wrap"] = True
+    value = st.segmented_control(label, options, default=default, key=key, **kw)
+    return value if value is not None else default
+
+
+def pills(label, options, key, **kw):
+    if "wrap" in _PILL_PARAMS:
+        kw["wrap"] = True
+    return st.pills(label, options, selection_mode="multi", default=[], key=key, **kw)
+
+
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
+
+def guilloche_svg(width: int = 1200, height: int = 120, strands: int = 12) -> str:
+    """Interlaced engraved sine curves, after the guilloché borders on banknotes."""
+    xs = np.linspace(0.0, width, 241)
+    envelope = 0.42 + 0.58 * np.sin(np.pi * xs / width) ** 0.8
+    paths = []
+    for k in range(strands):
+        phase = 2.0 * np.pi * k / strands
+        y = height / 2 + height * 0.40 * envelope * (
+            0.64 * np.sin(2 * np.pi * xs / 310.0 + phase) + 0.36 * np.sin(2 * np.pi * xs / 128.0 - 2 * phase))
+        d = "M" + " L".join(f"{a:.1f},{b:.2f}" for a, b in zip(xs, y))
+        cls = "g-accent" if k == 3 else "g-line"
+        paths.append(f'<path class="{cls}" d="{d}" pathLength="1" style="animation-delay:{k * 55}ms"/>')
+    return (f'<svg class="guilloche" viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
+            f'role="img" aria-label="Engraved line ornament">{"".join(paths)}</svg>')
+
+
+CSS = """
 <style>
-.block-container {max-width: 1180px; padding-top: 1.35rem; padding-bottom: 4rem;}
-[data-testid="stSidebar"] {display:none;}
-h1,h2,h3,p,div,span,label,button,input,select {
-    font-family: Helvetica, "Helvetica Neue", Arial, sans-serif;
-}
-h1 {font-weight:650; letter-spacing:-0.045em; font-size:2.75rem; line-height:1.02;}
-h2,h3 {font-weight:620; letter-spacing:-0.025em;}
-div[data-testid="stMetric"] {background:#f8fafc; border:1px solid #e5e7eb; padding:12px; border-radius:14px;}
-div[data-testid="stFileUploader"] {border:1px solid #e5e7eb; border-radius:14px; padding:8px;}
-.hero-shell {background:#111827; border-radius:22px; padding:3.4rem 3.6rem 3.1rem; margin:.35rem 0 2rem; box-shadow:0 12px 34px rgba(15,23,42,.10);}
-.hero-copy {max-width:900px;}
-.hero-kicker {font-size:.76rem; font-weight:500; letter-spacing:.14em; text-transform:uppercase; color:rgba(255,255,255,.62); margin-bottom:.7rem;}
-.hero-title {font-family:Helvetica, "Helvetica Neue", Arial, sans-serif; font-size:3.35rem; line-height:1; font-weight:500; letter-spacing:-.05em; color:#fff; margin:0 0 .9rem 0;}
-.hero-sub {font-family:Helvetica, "Helvetica Neue", Arial, sans-serif; font-size:1.08rem; line-height:1.55; font-weight:300; color:rgba(255,255,255,.80); max-width:760px;}
-.hero-pills {display:flex; gap:.5rem; flex-wrap:wrap; margin-top:1.35rem;}
-.hero-pills span {font-size:.76rem; color:rgba(255,255,255,.78); background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.16); border-radius:999px; padding:.32rem .68rem;}
+:root { --ink:#15302E; --ink-2:#4B6461; --intaglio:#0F5B52; --line:#9DBAB2; --bronze:#A07C00; --rule:#D3DDD9; }
+.block-container, [data-testid="stMainBlockContainer"] { max-width: 1080px; padding-top: 2.6rem; padding-bottom: 5rem; }
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] { display: none; }
+header[data-testid="stHeader"] { background: transparent; }
+.hero h1 { font-family: Spectral, Georgia, serif; font-weight: 400; font-size: clamp(2.5rem, 6vw, 3.9rem);
+           letter-spacing: -0.025em; line-height: 1.0; margin: 0; padding: 0; color: var(--ink); }
+.hero p { max-width: 60ch; color: var(--ink-2); font-size: 1.06rem; line-height: 1.6; margin: .9rem 0 0 0; }
+.guilloche { width: 100%; height: 112px; display: block; margin: 1.6rem 0 .5rem 0; overflow: visible; }
+.guilloche path { fill: none; stroke-width: .75; vector-effect: non-scaling-stroke;
+                  stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw 2.4s cubic-bezier(.3,.6,.2,1) forwards; }
+.guilloche .g-line { stroke: var(--line); }
+.guilloche .g-accent { stroke: var(--bronze); stroke-width: 1.1; }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+@media (prefers-reduced-motion: reduce) { .guilloche path { animation: none; stroke-dashoffset: 0; } }
+.sources-line { color: var(--ink-2); font-size: .86rem; margin: 0 0 .4rem 0; }
+.step { display: flex; align-items: baseline; gap: .8rem; margin: 2.6rem 0 0 0; }
+.step-n { font-family: Spectral, Georgia, serif; font-size: 2.1rem; color: var(--intaglio); line-height: 1; min-width: 1.1ch; }
+.step-title { font-family: Spectral, Georgia, serif; font-weight: 500; font-size: 1.55rem; line-height: 1.1; color: var(--ink); }
+.step-sub { color: var(--ink-2); font-size: .95rem; margin: .25rem 0 1.1rem 2.05rem; max-width: 70ch; }
+.group-name { font-weight: 600; color: var(--ink); margin-top: .3rem; }
+.group-help { color: var(--ink-2); font-size: .84rem; line-height: 1.45; margin-bottom: .6rem; }
+.group-gap { height: .35rem; }
+.result-title { font-family: Spectral, Georgia, serif; font-weight: 500; font-size: 1.9rem; color: var(--ink); margin: 3rem 0 .2rem 0; }
+.result-sub { color: var(--ink-2); font-size: .95rem; margin-bottom: 1rem; }
+.footnote { color: var(--ink-2); font-size: .84rem; }
+@media (max-width: 640px) { .step-sub { margin-left: 0; } .guilloche { height: 80px; } }
 </style>
-""", unsafe_allow_html=True)
+"""
 
-st.markdown("""
-<div class="hero-shell"><div class="hero-copy">
-  <div class="hero-kicker">Macroeconomic research utility</div>
-  <div class="hero-title">Macro Data Loader</div>
-  <div class="hero-sub">
-    Download, harmonise and export research-ready macro data for the euro area, European countries and the United States.
-  </div>
-  <div class="hero-pills">
-    <span>ECB</span><span>Eurostat</span><span>FRED</span><span>Excel output</span>
-  </div>
-</div></div>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Macro Data Loader", page_icon=":material/stacked_line_chart:", layout="wide")
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown(
+    '<div class="hero"><h1>Macro Data Loader</h1>'
+    "<p>Official macroeconomic series for the euro area, its member states and the United States, "
+    "brought to one frequency and delivered as an Excel workbook with the source of every column.</p></div>"
+    + guilloche_svg()
+    + '<p class="sources-line">Sources: ECB Data Portal, Eurostat, OECD, and BEA, BLS and the Federal Reserve through FRED.</p>',
+    unsafe_allow_html=True,
+)
 
-st.subheader("1 · Output")
-c1,c2,c3=st.columns([1.15,1.15,1])
+
+def step(n: int, title: str, sub: str = ""):
+    st.markdown(f'<div class="step"><span class="step-n">{n}</span><span class="step-title">{title}</span></div>'
+                + (f'<div class="step-sub">{sub}</div>' if sub else '<div style="height:.9rem"></div>'),
+                unsafe_allow_html=True)
+
+
+# --- 1 Output ---------------------------------------------------------------
+step(1, "Output", "What to build, for which economy, and over which period.")
+c1, c2 = st.columns([1.65, 1], gap="medium")
 with c1:
-    action=st.selectbox("Task",["Create a new workbook","Update an existing workbook"])
+    geography = segmented("Economy", GEOGRAPHIES, "Euro area", "geography")
 with c2:
-    geography=st.selectbox("Dataset",["Euro area","Euro-area countries","United States"])
+    freq_label = segmented("Frequency", list(FREQUENCIES), "Monthly", "freq_label")
+freq = FREQUENCIES[freq_label]
+is_us = geography == "United States"
+
+c3, d1, d2 = st.columns([1.3, 1, 1], gap="medium")
 with c3:
-    freq_label=st.selectbox("Frequency",["Monthly","Quarterly","Annual"])
-freq={"Monthly":"M","Quarterly":"Q","Annual":"A"}[freq_label]
-
-# Calendar controls. Defaults target the earliest broadly available period for
-# the core variables rather than an arbitrary 1999 cutoff.
-_default_start = date(1996, 1, 1) if geography != "United States" else date(1948, 1, 1)
-_default_end = date.today()
-d1,d2=st.columns(2)
+    action = segmented("Task", ["New workbook", "Update a workbook"], "New workbook", "action")
 with d1:
-    start_date=st.date_input(
-        "From", value=_default_start,
-        min_value=date(1913,1,1), max_value=date.today(),
-        format="DD/MM/YYYY",
-    )
+    start_date = st.date_input("From", value=date(1948, 1, 1) if is_us else date(1996, 1, 1),
+                               min_value=date(1913, 1, 1), max_value=date.today(), format="DD/MM/YYYY",
+                               key=f"start_{'us' if is_us else 'eu'}")
 with d2:
-    end_date=st.date_input(
-        "To", value=_default_end,
-        min_value=date(1913,1,1), max_value=date.today(),
-        format="DD/MM/YYYY",
-    )
-start_year=start_date.year
-end_year=end_date.year
+    end_date = st.date_input("To", value=date.today(), min_value=date(1913, 1, 1), max_value=date.today(),
+                             format="DD/MM/YYYY", key="end")
 
-uploaded=None
-sheet_name=None
-if action=="Update an existing workbook":
-    uploaded=st.file_uploader("Workbook to update",type=["xlsx"],key="update_workbook")
+uploaded, sheet_name, sheet_freq = None, None, None
+if action == "Update a workbook":
+    u1, u2 = st.columns([1.6, 1], gap="medium")
+    with u1:
+        uploaded = st.file_uploader("Workbook to update", type=["xlsx"], key="update_workbook")
     if uploaded is not None:
         try:
-            sheets=workbook_sheet_names(uploaded.getvalue())
-            sheet_name=st.selectbox("Sheet to update",sheets)
+            sheets = workbook_sheet_names(uploaded.getvalue())
+            with u2:
+                sheet_name = st.selectbox("Sheet", sheets)
+            sheet_freq = frequency_of_sheet(uploaded.getvalue(), sheet_name)
         except Exception as exc:
-            st.error(f"Could not read workbook: {exc}")
+            st.error(f"This file could not be opened as an Excel workbook ({type(exc).__name__}).")
+    st.caption("Only columns whose header matches a known series name are rewritten. Shock, forecast and "
+               "hand-kept rate columns, and any formula, are left as they are.")
 
-st.subheader("2 · Variables")
-eu_labels={
-    "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
-    "hicp_level":"HICP level","hicp_rate":"HICP inflation","unemployment_rate":"Unemployment rate",
-    "ip":"Industrial production","log_ip":"Log industrial production","energy_index":"Energy price index (HICP)",
-    "house_price_index":"Real estate / house price index",
-    "estr":"€STR","dfr":"Deposit facility rate (DFR)","mro":"Main refinancing operations rate (MRO)",
-    "aaa_1y":"EA AAA 1Y spot yield","aaa_10y":"EA AAA 10Y spot yield",
-    "sovereign_1y":"Sovereign 1Y yield","sovereign_10y":"Sovereign 10Y yield",
-    "eurostoxx50":"EURO STOXX 50 equity index",
-    "country_equity_index":"National reference equity index",
-    "hy_spread":"Corporate high-yield spread (OAS)",
-}
-us_labels={
-    "real_gdp":"Real GDP","real_gdp_growth":"Real GDP growth","log_real_gdp":"Log real GDP",
-    "cpi_level":"CPI level","inflation_rate":"CPI inflation","unemployment_rate":"Unemployment rate",
-    "ip":"Industrial production","log_ip":"Log industrial production","energy_cpi":"Energy price index (CPI)",
-    "house_price_index":"Real estate / house price index",
-    "fed_funds":"Effective federal funds rate","sofr":"SOFR",
-    "treasury_1y":"US Treasury 1Y yield","treasury_10y":"US Treasury 10Y yield",
-    "sp500":"S&P 500","djia":"Dow Jones Industrial Average",
-    "hy_spread":"Corporate high-yield spread (OAS)",
-}
-labels=us_labels if geography=="United States" else eu_labels
-if geography == "United States":
-    available_vars = list(US_VARS)
+# --- 2 Series ---------------------------------------------------------------
+step(2, "Series", "Pick what to include. Every series gets a neighbouring column naming its source.")
+labels = US_LABELS if is_us else EU_LABELS
+if is_us:
+    available = list(US_VARS)
 elif geography == "Euro area":
-    available_vars = [v for v in CANONICAL_VARS if v != "country_equity_index"]
-else:  # Euro-area countries
-    available_vars = list(CANONICAL_VARS)
-    # Keep country-level real-estate and energy indices explicitly available in the UI.
-    for _required_index in ("house_price_index", "energy_index", "country_equity_index", "eurostoxx50"):
-        if _required_index not in available_vars:
-            available_vars.append(_required_index)
-
-# Three compact research-oriented categories.
-# Nothing is pre-selected: users explicitly choose only the series they need.
-if geography == "United States":
-    variable_groups = {
-        "Macro": [
-            "real_gdp", "real_gdp_growth", "log_real_gdp", "cpi_level",
-            "inflation_rate", "unemployment_rate", "ip", "log_ip",
-        ],
-        "Rates & Money": [
-            "fed_funds", "sofr", "treasury_1y", "treasury_10y", "hy_spread",
-        ],
-        "Financial / Other Indexes": [
-            "sp500", "djia", "house_price_index", "energy_cpi",
-        ],
-    }
+    # sovereign_1y has no harmonised euro-area series and would always be empty.
+    available = [v for v in CANONICAL_VARS if v not in ("country_equity_index", "sovereign_1y")]
 else:
-    variable_groups = {
-        "Macro": [
-            "real_gdp", "real_gdp_growth", "log_real_gdp", "hicp_level",
-            "hicp_rate", "unemployment_rate", "ip", "log_ip",
-        ],
-        "Rates & Money": [
-            "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
-            "sovereign_1y", "sovereign_10y", "hy_spread",
-        ],
-        "Financial / Other Indexes": [
-            "eurostoxx50", "country_equity_index", "house_price_index", "energy_index",
-        ],
-    }
+    # No comparable country-level high-yield OAS exists; the column would be empty.
+    available = [v for v in CANONICAL_VARS if v != "hy_spread"]
 
-st.caption("Choose the series you want by category. Nothing is selected by default; click a pill to add it.")
-selected_vars = []
-_group_help = {
-    "Macro": "Activity, prices, production and labour-market indicators",
-    "Rates & Money": "Policy, sovereign yields and corporate credit spreads",
-    "Financial / Other Indexes": "Equity, real-estate and energy price indices",
-}
-# Three responsive category cards side by side on desktop.
-_cards = st.columns(3, gap="medium")
-for _card, (_group_name, _group_vars) in zip(_cards, variable_groups.items()):
-    _opts = [v for v in _group_vars if v in available_vars]
-    with _card:
-        with st.container(border=True):
-            st.markdown(f"#### {_group_name}")
-            st.caption(_group_help[_group_name])
-            if _opts:
-                _picked = st.pills(
-                    f"{_group_name} series", _opts, default=[], selection_mode="multi",
-                    format_func=lambda x: labels.get(x, x.replace("_", " ").title()),
-                    key=f"vars_{geography}_{_group_name}", label_visibility="collapsed",
-                )
-                selected_vars.extend(_picked or [])
-            else:
-                st.caption("No series available for this dataset.")
+selected: list = []
+for group, members in GROUPS["US" if is_us else "EU"].items():
+    options = [v for v in members if v in available]
+    if not options:
+        continue
+    g1, g2 = st.columns([1, 3.1], gap="large")
+    with g1:
+        st.markdown(f'<div class="group-name">{group}</div><div class="group-help">{GROUP_HELP[group]}</div>',
+                    unsafe_allow_html=True)
+    with g2:
+        picked = pills(group, options, key=f"vars_{geography}_{group}",
+                       format_func=lambda v: labels.get(v, v.replace("_", " ").title()),
+                       label_visibility="collapsed")
+        selected.extend(picked or [])
+    st.markdown('<div class="group-gap"></div>', unsafe_allow_html=True)
 
-# HY spreads are selected through the Rates & Money pills above, like all other series.
-# No separate corporate-spread checkbox.
-st.caption(f"{len(selected_vars)} of {len(available_vars)} available series selected.")
+st.caption(f"{len(selected)} of {len(available)} series selected." if selected else "Nothing selected yet.")
 
-monthly_gdp_method="Chow-Lin (industrial production)"
-if freq=="M" and any(v in selected_vars for v in ("real_gdp","real_gdp_growth","log_real_gdp")):
-    monthly_gdp_method=st.selectbox(
-        "Monthly GDP treatment",
-        ["Chow-Lin (industrial production)","Linear interpolation","Quarterly step (repeat within quarter)","Leave blank"],
-        help="Quarterly GDP is the benchmark. Chow-Lin uses monthly industrial production as the indicator."
-    )
+monthly_gdp_method = GDP_METHODS[0]
+countries = list(EA19)
+panel_format = "One sheet per country"
+needs_gdp_method = freq == "M" and any(v in selected for v in ("real_gdp", "real_gdp_growth", "log_real_gdp"))
+needs_fred = is_us or "hy_spread" in selected
 
-countries=EA19
-panel_format="One sheet per country"
-if geography=="Euro-area countries":
-    countries=st.multiselect(
-        "Countries",EA19,default=EA19,
-        format_func=lambda x:f"{x} — {COUNTRY_NAMES.get(x,x)}"
-    )
-    panel_format=st.selectbox("Country workbook layout",["One sheet per country","Long panel"])
+if geography == "Euro-area countries":
+    o1, o2 = st.columns([1.65, 1], gap="medium")
+    with o1:
+        countries = st.multiselect("Countries", EA19, default=EA19,
+                                   format_func=lambda x: f"{COUNTRY_NAMES.get(x, x)} ({x})")
+    with o2:
+        panel_format = segmented("Layout", ["One sheet per country", "Long panel"],
+                                 "One sheet per country", "panel_format")
+if needs_gdp_method:
+    g1, _ = st.columns([1.65, 1], gap="medium")
+    with g1:
+        monthly_gdp_method = st.selectbox(
+            "Monthly GDP", GDP_METHODS,
+            help="GDP is published quarterly. Chow-Lin uses monthly industrial production to distribute "
+                 "each quarter across its months; the three months always average to the published quarter.")
 
-if geography == "United States":
-    with st.expander("US data connection · FRED API key", expanded=True):
-        st.caption("FRED's keyless CSV host is timing out on Streamlit Cloud. Add a free FRED API key to enable the official authenticated API. Your key is not included in the Excel file.")
-        try:
-            configured_key = st.secrets.get("FRED_API_KEY", "")
-        except Exception:
-            configured_key = ""
-        fred_key_input = st.text_input("FRED API key (optional if configured in Streamlit secrets)",
-                                     type="password", key="fred_api_key_input",
-                                     help="Create a free key in your FRED account under API Keys; 32 lowercase letters/digits.")
-        configure_fred_api_key(fred_key_input or configured_key)
-        if not (fred_key_input or configured_key):
-            st.warning("No FRED API key configured. FRED-dependent series may fail if the public CSV host times out.")
+fred_key = secret_fred_key()
+if needs_fred:
+    with st.expander("FRED connection", expanded=False, icon=":material/key:"):
+        st.markdown(
+            "US series and high-yield spreads come from FRED. Without a key the app uses FRED's public CSV "
+            "download; with a free [FRED API key](https://fredaccount.stlouisfed.org/apikeys) it uses the "
+            "official API first, which is faster and more reliable. The key stays in this browser session "
+            "and is never written to the workbook.")
+        k1, k2 = st.columns([2.2, 1], gap="medium", vertical_alignment="bottom")
+        with k1:
+            typed = st.text_input("FRED API key", type="password", key="fred_key_input",
+                                  placeholder="Using the app's configured key" if fred_key else "32 lowercase letters and digits")
+        problem = mc.fred_key_problem(typed)
+        if typed and problem:
+            st.error(problem)
+        elif typed:
+            fred_key = typed.strip()
+        with k2:
+            if st.button("Check connection", width="stretch"):
+                with st.spinner("Contacting FRED"):
+                    res = mc.check_fred_connection(fred_key)
+                st.session_state["fred_check"] = res
+        res = st.session_state.get("fred_check")
+        if res:
+            for route, name in (("api", "Official API"), ("csv", "Public CSV")):
+                msg = res.get(route, "")
+                (st.success if msg == "OK" else st.warning)(f"{name}: {msg}")
 
-if geography=="United States":
-    st.caption("US sources: BEA, BLS, Federal Reserve/FRBNY and U.S. Treasury series distributed through FRED. The workbook records the source and series ID beside each variable.")
+# --- 3 Build ----------------------------------------------------------------
+step(3, "Build")
+blockers = []
+if not selected:
+    blockers.append("pick at least one series")
+if end_date < start_date:
+    blockers.append("set a 'To' date after the 'From' date")
+if geography == "Euro-area countries" and not countries:
+    blockers.append("choose at least one country")
+if action == "Update a workbook":
+    if geography == "Euro-area countries":
+        blockers.append("switch to Euro area or United States: updating works on a single sheet, not a country panel")
+    elif uploaded is None:
+        blockers.append("upload the workbook to update")
+    elif sheet_freq and sheet_freq != freq:
+        blockers.append(f"match the frequency: the sheet looks {FREQ_WORD[sheet_freq]}, "
+                        f"but {FREQ_WORD[freq]} is selected")
+
+run_label = "Build workbook" if action == "New workbook" else "Update workbook"
+run = st.button(run_label, type="primary", width="stretch", disabled=bool(blockers), icon=":material/table_view:")
+if blockers:
+    st.caption("To continue, " + "; ".join(blockers) + ".")
 else:
-    st.caption("European sources: ECB Data Portal, Eurostat, and OECD Financial Market national share-price indices via the direct OECD SDMX API. The app keeps source provenance beside each series.")
-    st.caption("Country-specific HY OAS is not reliably available from ECB/FRED; the country column is blank rather than an EA-wide proxy. EA and US HY OAS use ICE BofA series via FRED.")
-    st.caption("EA AAA yields are common fitted AAA curves. Sovereign 10Y is the broad EA convergence yield for EA output and the selected country's own convergence yield in country output.")
+    st.caption("Downloads are kept for six hours, so changing the period or layout and building again is quick.")
 
+if run and not blockers:
+    status = st.status("Downloading series", expanded=False)
+    bar = status.progress(0.0, text="Starting")
 
-# Public version: monetary-policy shock upload/integration is intentionally omitted.
-shock_uploads = []
-shock_file_previews = []
+    def progress(frac, text):
+        bar.progress(float(min(max(frac, 0.0), 1.0)) * 0.9, text=text)
 
-run_label = "Create workbook" if action == "Create a new workbook" else "Update workbook"
-run = st.button(run_label, type="primary", use_container_width=True)
-
-# Keep the latest successful download available for plotting even after
-# Streamlit reruns caused by changing the plot selector.
-if "last_datasets" not in st.session_state:
-    st.session_state["last_datasets"] = None
-if "last_frequency" not in st.session_state:
-    st.session_state["last_frequency"] = None
-if "last_output_bytes" not in st.session_state:
-    st.session_state["last_output_bytes"] = None
-if "last_output_filename" not in st.session_state:
-    st.session_state["last_output_filename"] = None
-if "last_meta" not in st.session_state:
-    st.session_state["last_meta"] = None
-if "last_summary" not in st.session_state:
-    st.session_state["last_summary"] = None
-if "last_action" not in st.session_state:
-    st.session_state["last_action"] = None
-
-if run:
-    if end_date < start_date:
-        st.error("The 'To' date must be on or after the 'From' date.")
-        st.stop()
-    if not selected_vars:
-        st.error("Select at least one macro variable.")
-        st.stop()
-    if geography == "Country-specific" and not countries:
-        st.error("Select at least one country.")
-        st.stop()
-    if action == "Update an existing workbook" and uploaded is None:
-        st.error("Upload a workbook first.")
-        st.stop()
-
-    prog = st.progress(0, text="Starting…")
     try:
+        sy, ey = int(start_date.year), int(end_date.year)
         if geography == "Euro area":
-            prog.progress(0.15, text="Comparing ECB and Eurostat series…")
-            df, meta = fetch_macro_dataset(
-                "EA_AUTO", freq, int(start_year), int(end_year), selected_vars, monthly_gdp_method
-            )
+            progress(0.1, "Comparing ECB and Eurostat series")
+            df, meta = fetch_macro_dataset("EA_AUTO", freq, sy, ey, selected, monthly_gdp_method,
+                                           fred_api_key=fred_key)
             datasets = {"EA": df}
-            prog.progress(0.80, text="Building output…")
-        elif geography == "United States":
-            prog.progress(0.15, text="Downloading official US series…")
-            df, meta = fetch_us_dataset_fast(
-                freq, int(start_year), int(end_year), selected_vars, monthly_gdp_method
-            )
+        elif is_us:
+            df, meta = fetch_us_dataset(freq, sy, ey, selected, monthly_gdp_method,
+                                        fred_api_key=fred_key, progress=progress)
             datasets = {"US": df}
-            prog.progress(0.80, text="Building output…")
         else:
-            datasets, meta = fetch_country_panel(
-                countries, freq, int(start_year), int(end_year), selected_vars,
-                monthly_gdp_method,
-                progress=lambda p, txt: prog.progress(min(int(p * 80), 80), text=txt),
-            )
+            datasets, meta = fetch_country_panel(countries, freq, sy, ey, selected, monthly_gdp_method,
+                                                 progress=progress, fred_api_key=fred_key)
 
-        shock_coverage = {}
-        shock_columns = []
-        if shock_uploads:
-            if len(shock_file_previews) != len(shock_uploads):
-                raise DataError("At least one uploaded shock workbook could not be read. Fix the file error shown above.")
-            _all_names = [str(c) for _,_,_,_,cols in shock_file_previews for c in cols]
-            _dups = sorted({c for c in _all_names if _all_names.count(c) > 1})
-            if _dups:
-                raise DataError(
-                    "Duplicate shock column names across uploaded workbooks: "
-                    + ", ".join(_dups)
-                    + ". Rename them so every imported shock series has a unique header."
-                )
+        if SHOCK_PREVIEWS:
+            from shock_tools import integrate_shocks
+            datasets, _, _ = integrate_shocks(datasets, SHOCK_PREVIEWS, freq)
 
-            _base_df = next(iter(datasets.values()))
-            _base_date_col = "date" if "date" in _base_df.columns else ("period" if "period" in _base_df.columns else _base_df.columns[0])
-            _macro_dates = _base_df[_base_date_col].tolist()
+        datasets = finalize(datasets, freq, start_date, end_date)
+        rows = meta_rows(meta, freq, monthly_gdp_method)
+        if all(d.empty for d in datasets.values()):
+            reasons = [f"{r['series']}: {r['note']}" for r in rows if str(r["source"]).startswith("Unavailable")]
+            raise DataError("Nothing to write: none of the selected series has observations between "
+                            f"{start_date:%d/%m/%Y} and {end_date:%d/%m/%Y}."
+                            + ("\n\n" + "\n\n".join(reasons[:8]) if reasons else ""))
+        bar.progress(0.95, text="Writing the workbook")
 
-            # Build one combined shock table on the macro date grid. Every value
-            # column from every uploaded workbook is imported automatically.
-            _combined = pd.DataFrame({"_period_key": [_macro_period_key(v, freq) for v in _macro_dates]})
-            for _sf, _preview, _date_col, _sheet, _value_cols in shock_file_previews:
-                if not _value_cols:
-                    continue
-                _aligned, _coverage, _used_sheet = _validate_and_prepare_shocks(
-                    _sf.getvalue(), freq, _value_cols, _macro_dates
-                )
-                _combined = _combined.merge(
-                    _aligned[["_period_key"] + _value_cols],
-                    on="_period_key",
-                    how="left",
-                    validate="one_to_one",
-                )
-                shock_columns.extend(_value_cols)
-                for _c, _n in _coverage.items():
-                    shock_coverage[f"{_sf.name} · {_c}"] = _n
-
-            datasets = _attach_shocks(datasets, _combined, shock_columns, freq)
-
-        # Standardize the final output date representation regardless of source/input format.
-        datasets = _canonicalize_dataset_dates(datasets, freq)
-
-        if action == "Create a new workbook":
-            # In country workbooks, show the familiar national reference-index name
-            # directly (DAX, CAC 40, FTSE MIB, etc.) instead of the generic
-            # country_equity_index header. Internal data remain canonical for plots.
-            workbook_datasets = datasets
-            if geography == "Euro-area countries" and "country_equity_index" in selected_vars:
-                workbook_datasets = {}
-                for _geo, _df in datasets.items():
-                    _x = _df.copy()
-                    _idx = REFERENCE_EQUITY_INDEX.get(_geo, "National equity index")
-                    _rename = {"country_equity_index": _idx}
-                    if "country_equity_index_source" in _x.columns:
-                        _rename["country_equity_index_source"] = f"{_idx}_source"
-                    workbook_datasets[_geo] = _x.rename(columns=_rename)
-            out = create_workbook(workbook_datasets, freq, panel_format=panel_format)
-            _slug = "ea" if geography == "Euro area" else ("us" if geography == "United States" else "countries")
-            filename = f"macro_{_slug}_{freq_label.lower()}.xlsx"
-            summary = {"updated_cells": 0, "added_rows": sum(len(x) for x in datasets.values())}
+        if action == "New workbook":
+            book = datasets
+            if geography == "Euro-area countries" and "country_equity_index" in selected:
+                book = {}
+                for geo, x in datasets.items():
+                    name = REFERENCE_EQUITY_INDEX.get(geo, "National equity index")
+                    book[geo] = x.rename(columns={"country_equity_index": name,
+                                                  "country_equity_index_source": f"{name}_source"})
+            out = create_workbook(book, freq, panel_format=panel_format, metadata_rows=rows,
+                                  geography="US" if is_us else "EA")
+            slug = "ea" if geography == "Euro area" else ("us" if is_us else "countries")
+            filename = f"macro_{slug}_{freq_label.lower()}.xlsx"
+            summary = None
         else:
-            if geography == "Euro-area countries":
-                st.error("Updating one existing sheet is designed for a single aggregate dataset. Create a new workbook for the multi-country panel.")
-                st.stop()
-            _update_key = "US" if geography == "United States" else "EA"
-            out, summary = update_workbook(
-                uploaded.getvalue(), sheet_name, datasets[_update_key], frequency=freq,
-                append_new_periods=True,
-                extra_columns=shock_columns if shock_uploads else None,
-            )
-            base = uploaded.name.rsplit(".", 1)[0]
-            filename = f"{base}_updated.xlsx"
+            out, summary = update_workbook(uploaded.getvalue(), sheet_name, datasets["US" if is_us else "EA"],
+                                           frequency=freq, append_new_periods=True)
+            filename = f"{uploaded.name.rsplit('.', 1)[0]}_updated.xlsx"
 
-        prog.progress(100, text="Done")
-        st.success("Finished successfully.")
-        st.session_state["last_datasets"] = datasets
-        st.session_state["last_frequency"] = freq
-        st.session_state["last_output_bytes"] = out
-        st.session_state["last_output_filename"] = filename
-        st.session_state["last_meta"] = [m.__dict__ for m in meta]
-        st.session_state["last_summary"] = summary
-        st.session_state["last_action"] = action
-
-        c1, c2, c3 = st.columns(3)
-        latest = max((m.latest_period for m in meta if m.latest_period), default="—")
-        c1.metric("Latest source observation", latest)
-        c2.metric("Series downloaded", len(meta))
-        c3.metric("Periods in output", sum(len(x) for x in datasets.values()))
-
-        if geography == "Euro area":
-            st.subheader("Preview")
-            st.dataframe(datasets["EA"].tail(18), use_container_width=True, hide_index=True)
-
-        _show_diagnostics(datasets, freq)
-
-        st.subheader("Series information")
-        meta_df = pd.DataFrame([m.__dict__ for m in meta])
-        if not meta_df.empty:
-            # Make construction/manipulation explicit, not only source provenance.
-            _construction = {
-                "real_gdp_growth": "Derived: log growth of real GDP; 12-month / 4-quarter / 1-year change according to output frequency.",
-                "log_real_gdp": "Derived: natural logarithm of real GDP.",
-                "hicp_rate": "Derived: 12-month / 4-quarter / 1-year log change of the all-items HICP index.",
-                "inflation_rate": "Derived: 12-month / 4-quarter / 1-year log change of CPI.",
-                "log_ip": "Derived: natural logarithm of the industrial-production index.",
-                "real_gdp": (
-                    "Direct quarterly/annual benchmark. For monthly output: "
-                    + ("Chow-Lin temporal disaggregation using industrial production as indicator."
-                       if "Chow-Lin" in monthly_gdp_method else
-                       "Monthly temporal conversion: " + monthly_gdp_method + ".")
-                    if freq == "M" else
-                    "Direct benchmark series converted only to the selected output frequency when necessary."
-                ),
-                "dfr": "ECB policy-rate level. Last announced rate is carried forward between change dates, then averaged within the requested period.",
-                "mro": "ECB policy-rate level. Last announced rate is carried forward between change dates, then averaged within the requested period.",
-                "estr": "Direct €STR observations; higher-frequency observations are averaged within the requested period.",
-                "aaa_1y": "Direct ECB fitted euro-area AAA government-bond 1Y spot yield; daily observations are period-averaged.",
-                "aaa_10y": "Direct ECB fitted euro-area AAA government-bond 10Y spot yield; daily observations are period-averaged.",
-                "sovereign_10y": "Direct ECB convergence-purpose government yield; EA aggregate for EA output, country-specific for country output.",
-                "fed_funds": "Direct effective federal funds rate; monthly source or period average at lower frequency.",
-                "sofr": "Direct SOFR; observations are averaged within the requested period.",
-                "treasury_1y": "Direct US Treasury/Federal Reserve constant-maturity 1Y yield; period-averaged where needed.",
-                "treasury_10y": "Direct US Treasury/Federal Reserve constant-maturity 10Y yield; period-averaged where needed.",
-                "eurostoxx50": "ECB EURO STOXX 50 historical close, average of observations through period; monthly observations are averaged to quarterly/annual output.",
-                "country_equity_index": "OECD Financial Market harmonised national share-price series via the direct OECD SDMX API. Country workbooks display the familiar national reference-index name (for example DAX, CAC 40 or FTSE MIB) instead of a generic column label.",
-                "sp500": "S&P 500 daily close via FRED; arithmetic mean of daily closes within the requested month/quarter/year.",
-                "djia": "Dow Jones Industrial Average daily close via FRED; arithmetic mean of daily closes within the requested month/quarter/year.",
-            }
-            # Meta variable names are not perfectly uniform, so match normalized labels.
-            def _how(row):
-                v=str(row.get("variable","")).strip().lower().replace(" ","_")
-                aliases={
-                    "real_gdp":"real_gdp","real_gdp_growth":"real_gdp_growth",
-                    "industrial_production":"ip","cpi":"cpi_level",
-                    "unemployment":"unemployment_rate","hicp":"hicp_level",
-                    "sovereign_10y_yield":"sovereign_10y",
-                    "ea_sovereign/convergence_10y_yield":"sovereign_10y",
-                    "country_sovereign_10y_yield":"sovereign_10y",
-                }
-                k=aliases.get(v,v)
-                if k in _construction: return _construction[k]
-                note=str(row.get("note","") or "").strip()
-                return note if note else "Downloaded directly from the stated source; only frequency alignment/period averaging is applied when required."
-            meta_df["construction / manipulation"] = meta_df.apply(_how,axis=1)
-            st.dataframe(meta_df, use_container_width=True, hide_index=True)
-        if action == "Update an existing workbook":
-            with st.expander("Update details"):
-                st.json(summary)
-
+        st.session_state["result"] = {
+            "datasets": datasets, "freq": freq, "bytes": out, "filename": filename,
+            "meta": rows, "summary": summary, "action": action, "geography": geography,
+            "labels": labels, "built": pd.Timestamp.now().strftime("%d %b %Y, %H:%M"),
+        }
+        bar.progress(1.0, text="Done")
+        status.update(label="Workbook ready", state="complete")
     except DataError as exc:
-        prog.empty()
-        st.error(f"Data download problem: {exc}")
-        st.caption("The app tries both ECB and Eurostat where an equivalent series is mapped, then reports the detailed failure.")
+        status.update(label="Download stopped", state="error")
+        st.error(f"{mc.redact(exc)}")
+        st.caption("Each source is tried with fallbacks before stopping. If one provider is down, "
+                   "deselect its series and build again.")
     except Exception as exc:
-        prog.empty()
-        st.exception(exc)
+        status.update(label="Something went wrong", state="error")
+        st.error(f"Unexpected {type(exc).__name__}: {mc.redact(exc)}")
+        with st.expander("Technical details"):
+            st.exception(exc)
 
+# --- Results ----------------------------------------------------------------
+res = st.session_state.get("result")
+if res:
+    rfreq = res["freq"]
+    datasets = res["datasets"]
+    rlabels = res["labels"]
+    first_df = next(iter(datasets.values()))
+    noun = "Workbook updated" if res["action"] == "Update a workbook" else "Your workbook"
+    st.markdown(f'<div class="result-title">{noun}</div>'
+                f'<div class="result-sub">{res["geography"]}, {FREQ_WORD[rfreq]}. Built {res["built"]}.</div>',
+                unsafe_allow_html=True)
+    st.download_button(f"Download {res['filename']}", data=res["bytes"], file_name=res["filename"],
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       type="primary", width="stretch", icon=":material/download:", key="download")
 
-# The generated workbook lives in session state, so ordinary Streamlit reruns
-# (changing selectors, opening expanders, plotting, etc.) never make the download vanish.
-if st.session_state.get("last_output_bytes") is not None:
-    st.download_button(
-        "⬇️ Download Excel",
-        data=st.session_state["last_output_bytes"],
-        file_name=st.session_state.get("last_output_filename") or "macro_data.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        use_container_width=True,
-        key="persistent_excel_download",
-    )
-    st.caption("The latest completed workbook stays available here until you create or update another one.")
+    meta_df = pd.DataFrame(res["meta"])
+    unavailable = meta_df[meta_df["source"].astype(str).str.startswith("Unavailable")] if not meta_df.empty else meta_df
+    ends = [d["date"].iloc[-1] for d in datasets.values() if not d.empty]
+    latest = max(ends, key=lambda v: mc.label_to_period(v, rfreq) or pd.Period("1900", "Y").asfreq(
+        {"M": "M", "Q": "Q", "A": "Y"}[rfreq])) if ends else "None"
+    n_rows = sum(len(d) for d in datasets.values())
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Latest observation", latest,
+              help="Latest period with any data. For daily series the current period can still be in progress.")
+    m2.metric("Series", len(value_columns(first_df)))
+    m3.metric("Rows", f"{n_rows:,}")
+    m4.metric("Unavailable", len(unavailable))
+    if len(unavailable):
+        st.warning("Some series could not be downloaded; their columns are empty and the source cell says why.\n\n"
+                   + "\n".join(f"- **{r.series}** ({r.series_id}): {r.note}" for r in unavailable.itertuples()))
 
-st.divider()
-@st.fragment
-def _plot_area():
-    st.subheader("Plot a time series")
-    _plot_sets = st.session_state.get("last_datasets")
-    if _plot_sets:
-        _geos = list(_plot_sets.keys())
-        _pc1, _pc2 = st.columns([1, 2])
-        with _pc1:
-            _plot_geo = st.selectbox("Geography", _geos, key="plot_geography")
-        _pdf = _plot_sets[_plot_geo].copy()
+    summary = res.get("summary")
+    if summary:
+        lines = [f"{summary['updated_cells']:,} cells updated and {summary['added_rows']} rows appended.",
+                 "Columns updated: " + (", ".join(summary["recognized_columns"]) or "none") + "."]
+        if summary.get("missing_columns"):
+            lines.append("Downloaded but not in the sheet (no matching header): "
+                         + ", ".join(summary["missing_columns"]) + ".")
+        if summary.get("protected_columns"):
+            lines.append("Protected, left untouched: " + ", ".join(summary["protected_columns"]) + ".")
+        if summary.get("formula_cells_kept"):
+            lines.append(f"{summary['formula_cells_kept']} formula cells left untouched.")
+        st.info("\n\n".join(lines))
+        for w in summary.get("level_warnings", []):
+            st.warning(w)
 
-        # Only numeric data columns; hide source/provenance columns.
-        _plot_vars = [
-            c for c in _pdf.columns
-            if c not in ("period", "date", "country", "geo")
-            and not str(c).endswith("_source")
-            and pd.api.types.is_numeric_dtype(_pdf[c])
-        ]
-        with _pc2:
-            _plot_var = st.selectbox(
-                "Variable",
-                _plot_vars,
-                key="plot_variable",
-                format_func=lambda x: labels.get(x, x.replace("_", " ").title()),
-            ) if _plot_vars else None
+    t_prev, t_chart, t_checks, t_src = st.tabs(["Preview", "Chart", "Checks", "Sources"])
 
-        if _plot_var:
-            _xcol = "period" if "period" in _pdf.columns else ("date" if "date" in _pdf.columns else None)
-            if _xcol:
-                _chart = _pdf[[_xcol, _plot_var]].dropna().copy()
-                _chart[_xcol] = _chart[_xcol].astype(str)
-                if not _chart.empty:
-                    st.line_chart(_chart.set_index(_xcol)[_plot_var], use_container_width=True)
-                    _first = _chart.iloc[0]
-                    _last = _chart.iloc[-1]
-                    st.caption(
-                        f"{labels.get(_plot_var, _plot_var)} · "
-                        f"{_first[_xcol]} to {_last[_xcol]} · {_plot_geo}"
-                    )
-                else:
-                    st.info("The selected variable has no observations in the downloaded range.")
+    with t_prev:
+        geo = st.selectbox("Sheet", list(datasets), key="preview_geo") if len(datasets) > 1 else next(iter(datasets))
+        pdf = datasets[geo]
+        st.dataframe(pdf[[c for c in pdf.columns if not str(c).endswith("_source")]],
+                     hide_index=True, height=420, width="stretch")
+        st.caption("Source columns are hidden here; they sit beside each series in the workbook and are listed "
+                   "under Sources.")
+
+    with t_chart:
+        @st.fragment
+        def chart_panel():
+            if len(datasets) > 1:
+                cc1, cc2 = st.columns([1, 3], gap="medium")
+                with cc1:
+                    cgeo = st.selectbox("Sheet", list(datasets), key="chart_geo",
+                                        format_func=lambda g: COUNTRY_NAMES.get(g, g))
             else:
-                st.info("No period/date column was found for plotting.")
-    else:
-        st.caption("Create or update a workbook first. The downloaded series will then be available here for plotting.")
+                cc2 = st.container()
+                cgeo = next(iter(datasets))
+            cdf = datasets[cgeo]
+            options = value_columns(cdf)
+            with cc2:
+                picks = st.multiselect("Series (up to six)", options, default=options[:1], max_selections=6,
+                                       format_func=lambda c: rlabels.get(c, c), key="chart_vars")
+            scale = segmented("Scale", ["Original units", "Index, first common period = 100", "Standardised (z-score)"],
+                              "Original units", "chart_scale")
+            if not picks:
+                st.caption("Choose one or more series to plot.")
+                return
+            frame, skipped = chart_frame(cdf, picks, rfreq, scale)
+            frame = frame.rename(columns=lambda c: rlabels.get(c, c))
+            if frame.dropna(how="all").empty:
+                st.caption("These series have no overlapping observations to plot.")
+                return
+            st.line_chart(frame, height=380, width="stretch")
+            span = frame.dropna(how="all").index
+            st.caption(f"{span.min():%b %Y} to {span.max():%b %Y}. "
+                       + ("Series in different units share one axis here; switch the scale to compare their shape. "
+                          if scale == "Original units" and len(picks) > 1 else "")
+                       + (f"Not indexed (non-positive base value): {', '.join(skipped)}." if skipped else ""))
 
-_plot_area()
+        chart_panel()
 
-with st.expander("Variable definitions, construction and sources"):
+    with t_checks:
+        any_issue = False
+        for geo, df in datasets.items():
+            issues = run_checks(df, rfreq)
+            if not issues:
+                continue
+            any_issue = True
+            if len(datasets) > 1:
+                st.markdown(f"**{COUNTRY_NAMES.get(geo, geo)}**")
+            for kind, msg in issues:
+                {"error": st.error, "warning": st.warning, "info": st.info}[kind](msg)
+        if not any_issue:
+            st.success("No duplicate dates, gaps inside the sample, placeholder zeros or extreme jumps.")
+        st.caption("Leading and trailing blanks are normal: series start at different dates and are published "
+                   "with different lags. The checks look only inside each series' own span.")
+
+    with t_src:
+        if not meta_df.empty:
+            show = meta_df[["series", "source", "series_id", "geography", "native_frequency",
+                            "latest_observation", "construction"]]
+            st.dataframe(show, hide_index=True, width="stretch",
+                         column_config={"construction": st.column_config.TextColumn("construction", width="large")})
+            st.caption("The same table is saved in the workbook's 'sources' sheet.")
+
+# --- Reference --------------------------------------------------------------
+st.markdown('<div style="height:3rem"></div>', unsafe_allow_html=True)
+with st.expander("Definitions and sources"):
     st.markdown("""
-**Dates and availability**
-- The **From / To** controls use calendar dates. Output is still aligned to the selected monthly, quarterly or annual frequency.
-- The default start is **1996 for European datasets**, which is close to the beginning of the core harmonised EA macro series, and **1948 for the US**, when the main GDP/labour-market core is broadly available.
-- Individual variables can begin later. The app never invents pre-history: unavailable observations remain blank.
+**Dates.** The From and To dates are applied at the output frequency: 15 March 2001 means 2001-03, 2001q1 or 2001.
+Rows before the first and after the last available observation are dropped. Dates are written as text:
+`YYYY-MM`, `YYYYqN` or `YYYY`.
 
-**European macro variables**
-- **Real GDP** — official quarterly real-GDP benchmark. Annual output is frequency-converted from the official benchmark. Monthly GDP is not directly observed: the selected method is used, with **Chow–Lin + industrial production** as the preferred default.
-- **Real GDP growth** — derived from real GDP using the appropriate year-on-year log change.
-- **Log real GDP** — natural logarithm of the real-GDP level.
-- **HICP level** — directly downloaded all-items harmonised consumer-price index.
-- **HICP inflation** — derived from the HICP level as the year-on-year log change.
-- **Unemployment** — directly downloaded harmonised unemployment rate.
-- **Industrial production** — directly downloaded official industrial-production index; frequency aggregation is applied only when required.
-- **Log industrial production** — natural logarithm of industrial production.
-- **Energy index** — directly downloaded HICP energy/special aggregate.
-- **DFR / MRO** — official ECB policy-rate levels. The prevailing rate is **carried forward between policy changes**, then averaged within month/quarter/year, so unchanged periods are not missing.
-- **€STR** — official €STR observations, averaged to the requested frequency where needed.
-- **EA AAA 1Y / 10Y** — ECB fitted AAA government-bond spot curves; daily observations are period-averaged. Their official history starts later than the core macro data.
-- **Sovereign 10Y** — ECB convergence-purpose government yield: broad EA aggregate for EA output and the individual country's yield for country output. It is not treated as equivalent to the AAA curve.
-- **EURO STOXX 50** — ECB historical-close equity index, using the ECB period-average convention. It can be included in the EA aggregate and in every country workbook as the common euro-area market benchmark.
-- **National reference equity index** — OECD Financial Market harmonised national share-price series retrieved directly through the OECD SDMX API. Country workbooks use the familiar reference-index name (for example DAX, CAC 40 or FTSE MIB) as the column header. Monthly observations are averaged to quarterly/annual frequency.
+**Growth and inflation.** Simple year-on-year percentage changes (12 months, 4 quarters or 1 year), the same
+convention as the published HICP and CPI rates. Quarterly and annual inflation are averages of the monthly rates.
 
-**United States**
-- **Real GDP** — BEA real GDP (`GDPC1`) distributed through FRED. Monthly values are temporally disaggregated from the quarterly benchmark using the selected method.
-- **CPI** — BLS CPI (`CPIAUCSL`) distributed through FRED.
-- **CPI inflation** — derived year-on-year log change of CPI.
-- **Unemployment** — BLS unemployment rate (`UNRATE`).
-- **Industrial production** — Federal Reserve industrial production (`INDPRO`).
-- **Energy CPI** — BLS energy CPI.
-- **Federal funds rate** — effective federal funds rate.
-- **SOFR** — Federal Reserve Bank of New York SOFR.
-- **Treasury 1Y / 10Y** — US Treasury/Federal Reserve constant-maturity yields (`GS1`, `GS10`).
-- **S&P 500 / Dow Jones Industrial Average** — daily closing price indices (`SP500`, `DJIA`) distributed through FRED and averaged within the selected month/quarter/year.
+**Monthly GDP.** GDP is published quarterly. Chow-Lin estimates the monthly path from industrial production and a
+trend by maximum likelihood; the three months of each quarter average exactly to the published level. Linear
+interpolation centres each quarter on its middle month. No months are filled beyond the last published quarter.
 
+**Daily series.** Policy rates, money-market rates, yields, spreads and equity indices are averaged over the
+observations in each period. ECB policy rates are carried forward between decisions, up to today.
+
+**Euro area.** ECB Data Portal and Eurostat; where both publish an equivalent series the one with the longest and
+most recent history is used. National equity indices are OECD harmonised share-price indices, labelled with the
+familiar market name (DAX, CAC 40, FTSE MIB). No harmonised euro-area 1-year sovereign yield or country-level
+high-yield spread exists, so those are not offered.
+
+**United States.** BEA real GDP (GDPC1), BLS CPI-U (CPIAUCSL) and unemployment (UNRATE), Federal Reserve
+industrial production (INDPRO), federal funds (FEDFUNDS) and Treasury yields (GS1, GS10), FRBNY SOFR, FHFA house
+prices (USSTHPI) and ICE BofA high-yield OAS, all through FRED. S&P 500 and Dow Jones come from Yahoo Finance
+because FRED licenses only their last ten years.
 """)
+    if st.button("Clear downloaded data", help="Forget the downloads kept for six hours and fetch fresh copies next time."):
+        mc.clear_download_cache()
+        st.toast("Download cache cleared.")

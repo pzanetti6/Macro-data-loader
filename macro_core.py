@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import io
+import os
 import re
-import itertools
-import math
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
-import time
+from requests.adapters import HTTPAdapter
 
 EUROSTAT_STATS = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
 ECB_DATA = "https://data-api.ecb.europa.eu/service/data"
@@ -94,6 +96,129 @@ class FetchMeta:
     note: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Shared HTTP layer: one pooled session per thread, retries on transient
+# errors, a small in-process cache, and redaction of secrets in every message.
+# ---------------------------------------------------------------------------
+
+USER_AGENT = "Macro-Data-Loader/2.0 (+https://github.com; research use)"
+_CACHE_TTL_SECONDS = 6 * 3600
+_TRANSIENT = {429, 500, 502, 503, 504}
+_SECRET_RE = re.compile(r"(api_key=)[^&\s'\"]+", re.I)
+
+
+def redact(text) -> str:
+    """Remove API keys from any text that might reach the UI or a workbook."""
+    return _SECRET_RE.sub(r"\1***", str(text))
+
+
+class _TTLCache:
+    """Thread-safe process-level cache. Streamlit reruns and country workers share it."""
+
+    def __init__(self, ttl: float, max_items: int = 1024):
+        self.ttl = ttl
+        self.max_items = max_items
+        self._data: Dict[tuple, Tuple[float, object]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            hit = self._data.get(key)
+            if hit is None:
+                return None
+            stamp, value = hit
+            if time.time() - stamp > self.ttl:
+                self._data.pop(key, None)
+                return None
+            return value
+
+    def set(self, key, value):
+        with self._lock:
+            if len(self._data) >= self.max_items:
+                oldest = sorted(self._data.items(), key=lambda kv: kv[1][0])[: self.max_items // 4]
+                for k, _ in oldest:
+                    self._data.pop(k, None)
+            self._data[key] = (time.time(), value)
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
+
+_CACHE = _TTLCache(_CACHE_TTL_SECONDS)
+
+
+def clear_download_cache() -> None:
+    """Forget every cached download (used by the UI's 'refresh' action)."""
+    _CACHE.clear()
+
+
+class _RateLimiter:
+    """Minimum spacing between calls to one host (FRED allows about 2 requests/second)."""
+
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._next = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            if self._next > now:
+                time.sleep(self._next - now)
+                now = time.monotonic()
+            self._next = now + self.min_interval
+
+
+_thread_local = threading.local()
+
+
+def _session() -> requests.Session:
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": USER_AGENT})
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        s.mount("https://", adapter)
+        _thread_local.session = s
+    return s
+
+
+def _http_get(url: str, *, params=None, headers=None, timeout=(6, 30), retries: int = 2,
+              limiter: Optional[_RateLimiter] = None, label: str = "") -> requests.Response:
+    """GET with bounded retries on 429/5xx and network errors.
+
+    Returns the final response whatever its status (callers decide what a 404
+    means). Raises DataError only when no response could be obtained. Messages
+    never include the request URL, because FRED URLs carry the API key.
+    """
+    last = "no response"
+    for attempt in range(retries + 1):
+        if limiter is not None:
+            limiter.wait()
+        try:
+            r = _session().get(url, params=params, headers=headers, timeout=timeout)
+        except requests.Timeout:
+            last = "timed out"
+        except requests.ConnectionError:
+            last = "connection failed"
+        except requests.RequestException as exc:
+            last = type(exc).__name__
+        else:
+            if r.status_code in _TRANSIENT and attempt < retries:
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    pause = float(retry_after) if retry_after else 1.5 * (2 ** attempt)
+                except (TypeError, ValueError):
+                    pause = 1.5 * (2 ** attempt)
+                time.sleep(min(pause, 15))
+                continue
+            return r
+        if attempt < retries:
+            time.sleep(1.0 * (2 ** attempt))
+    raise DataError(f"{label or url.split('/')[2]}: {last}")
+
+
 def _decode_jsonstat(js: dict) -> pd.DataFrame:
     """Decode Eurostat JSON-stat 2.0 response to a tidy DataFrame."""
     ids = js.get("id", [])
@@ -160,17 +285,24 @@ class EurostatClient:
             params.append(("sinceTimePeriod", start))
         if end:
             params.append(("untilTimePeriod", end))
+        cache_key = ("eurostat", dataset, tuple(params))
+        cached = _CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
         url = f"{EUROSTAT_STATS}/{dataset}"
         try:
             r = self.session.get(url, params=params, timeout=(5, self.timeout))
         except requests.RequestException as exc:
-            raise DataError(f"Eurostat {dataset}: network request failed: {exc}") from exc
+            raise DataError(f"Eurostat {dataset}: network request failed ({type(exc).__name__})") from exc
         if r.status_code != 200:
             raise DataError(f"Eurostat {dataset} returned HTTP {r.status_code}: {r.text[:240]}")
         js = r.json()
         if js.get("error"):
             raise DataError(f"Eurostat {dataset}: {js['error']}")
-        return _decode_jsonstat(js)
+        out = _decode_jsonstat(js)
+        if not out.empty:
+            _CACHE.set(cache_key, out)
+        return out.copy()
 
     def first_working(self, dataset: str, filter_candidates: Sequence[Dict[str, object]],
                       start: Optional[str], end: Optional[str]) -> pd.DataFrame:
@@ -202,6 +334,10 @@ class ECBClient:
         if end:
             params["endPeriod"] = end
         url = f"{ECB_DATA}/{flow}/{key}"
+        cache_key = ("ecb", flow, key, start, end)
+        cached = _CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
         # ECB's Data Portal occasionally returns transient gateway errors (especially
         # when several country series are requested one after another). Retry with
         # exponential backoff instead of aborting the whole multi-country download.
@@ -213,7 +349,7 @@ class ECBClient:
                                      headers={"Accept": "text/csv"})
             except requests.RequestException as exc:
                 if attempt == 4:
-                    raise DataError(f"ECB {flow}/{key}: network error after 5 attempts: {exc}")
+                    raise DataError(f"ECB {flow}/{key}: network error after 5 attempts ({type(exc).__name__})")
                 time.sleep(1.5 * (2 ** attempt))
                 continue
             if r.status_code == 200:
@@ -238,7 +374,9 @@ class ECBClient:
                       index=df["TIME_PERIOD"].astype(str).values).dropna()
         if s.empty:
             raise DataError(f"ECB {flow}/{key}: no numeric observations returned.")
-        return s[~s.index.duplicated(keep="last")].sort_index()
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        _CACHE.set(cache_key, s)
+        return s.copy()
 
 
 def _ecb_area(geo: str, evolving_ea: bool = False) -> str:
@@ -521,8 +659,13 @@ def _fetch_ip(client: EurostatClient, geo: str, start_m: str, end_m: str) -> pd.
 
 def _fetch_gdp_q(client: EurostatClient, geo: str, start_q: str, end_q: str) -> pd.Series:
     # Seasonally/calendar adjusted GDP at market prices, chain-linked volumes.
+    # CLV10_MEUR stays first so existing workbooks keep the same level basis;
+    # the newer 2020/2015 reference years are fallbacks if Eurostat retires it.
     cands = [
         {"geo": geo, "na_item": "B1GQ", "unit": "CLV10_MEUR", "s_adj": "SCA"},
+        {"geo": geo, "na_item": "B1GQ", "unit": "CLV20_MEUR", "s_adj": "SCA"},
+        {"geo": geo, "na_item": "B1GQ", "unit": "CLV15_MEUR", "s_adj": "SCA"},
+        {"geo": geo, "na_item": "B1GQ", "unit": "CLV_I20", "s_adj": "SCA"},
         {"geo": geo, "na_item": "B1GQ", "unit": "CLV_I15", "s_adj": "SCA"},
         {"geo": geo, "na_item": "B1GQ", "unit": "CLV10_MEUR"},
     ]
@@ -555,26 +698,49 @@ def _aggregate_monthly(s: pd.Series, freq: str, how: str = "mean") -> pd.Series:
 
 
 
-def _ar1_cov(n: int, rho: float) -> np.ndarray:
-    idx = np.arange(n)
-    return rho ** np.abs(idx[:, None] - idx[None, :])
+_CL_D = np.arange(-2, 3)                 # month offsets a-b within a quarter pair
+_CL_W = (3 - np.abs(_CL_D)).astype(float)  # how often each offset occurs (1,2,3,2,1)
 
 
-def _chow_lin_monthly(q: pd.Series, indicator_m: pd.Series) -> pd.Series:
-    """Chow-Lin disaggregation of quarterly GDP using monthly IP.
+def _chow_lin_cov(rho: float, q_start: np.ndarray) -> np.ndarray:
+    """Quarterly covariance C V C' of an AR(1) monthly error, in closed form.
 
-    Quarterly real GDP is treated as a level index/volume measure: the three
-    estimated monthly GDP levels are constrained to average exactly to the
-    observed quarterly GDP level.
+    V[m, n] = rho^|m-n| on actual month ordinals and C averages the three months
+    of each quarter, so (C V C')[i, j] = (1/9) * sum_{a,b} rho^|s_i - s_j + a - b|
+    with s the first-month ordinal of each quarter. This is O(nq^2) instead of
+    the O(nm^2 nq) dense product, which made long US monthly samples time out.
+    """
+    lag = q_start[:, None] - q_start[None, :]
+    expo = np.abs(lag[:, :, None] + _CL_D[None, None, :])
+    return (np.power(rho, expo) * _CL_W).sum(axis=2) / 9.0
+
+
+def _chow_lin_cross(rho: float, m_ord: np.ndarray, q_start: np.ndarray) -> np.ndarray:
+    """Cross covariance V C' between monthly errors and quarterly averages."""
+    lag = m_ord[:, None] - q_start[None, :]
+    expo = np.abs(lag[:, :, None] - np.arange(3)[None, None, :])
+    return np.power(rho, expo).sum(axis=2) / 3.0
+
+
+def _chow_lin_monthly(q: pd.Series, indicator_m: pd.Series, refine: bool = True) -> pd.Series:
+    """Chow-Lin (ML) disaggregation of quarterly GDP using monthly IP.
+
+    Regressors: constant, standardised IP and a linear time trend. Quarterly real
+    GDP is a level/volume measure, so each quarter's three monthly estimates
+    average exactly to the published quarterly level. The AR(1) parameter is
+    chosen by maximising the concentrated likelihood on a grid over
+    [-0.90, 0.98], then refined locally by golden-section search.
+    No months are extrapolated beyond the last published quarter.
     """
     q = q.dropna().astype(float).sort_index()
-    indicator_m = indicator_m.dropna().astype(float).sort_index()
-    usable_q, months = [], []
+    ind_all = indicator_m.dropna().astype(float).sort_index()
+    ind_all = ind_all[~ind_all.index.duplicated(keep="last")]
+    have = set(ind_all.index)
+    usable_q = []
     for qp in q.index:
-        mm = pd.period_range(qp.asfreq("M", "start"), qp.asfreq("M", "end"), freq="M")
-        if all(m in indicator_m.index and pd.notna(indicator_m.loc[m]) for m in mm):
+        first = qp.asfreq("M", "start")
+        if first in have and (first + 1) in have and (first + 2) in have:
             usable_q.append(qp)
-            months.extend(mm)
 
     if len(usable_q) < 4:
         raise DataError(
@@ -582,48 +748,89 @@ def _chow_lin_monthly(q: pd.Series, indicator_m: pd.Series) -> pd.Series:
             "monthly industrial-production data. Use Linear interpolation for a shorter sample."
         )
 
+    nq = len(usable_q)
     y = q.loc[usable_q].to_numpy(dtype=float)
-    mindex = pd.PeriodIndex(months, freq="M")
-    ind = indicator_m.loc[mindex].to_numpy(dtype=float)
-    sd = float(np.nanstd(ind))
+    first_months = [qp.asfreq("M", "start") for qp in usable_q]
+    mindex = pd.PeriodIndex([fm + k for fm in first_months for k in range(3)], freq="M")
+    q_start = np.array([fm.ordinal for fm in first_months], dtype=np.int64)
+    m_ord = np.array([m.ordinal for m in mindex], dtype=np.int64)
+
+    ind = ind_all.reindex(mindex).to_numpy(dtype=float)
+    sd = float(np.std(ind))
     if not np.isfinite(sd) or sd == 0:
         raise DataError("Industrial production has no usable variation for Chow-Lin.")
-
-    z = (ind - np.nanmean(ind)) / sd
-    trend = np.linspace(-1.0, 1.0, len(ind))
+    z = (ind - ind.mean()) / sd
+    span = max(int(m_ord[-1] - m_ord[0]), 1)
+    trend = -1.0 + 2.0 * (m_ord - m_ord[0]) / span
     X = np.column_stack([np.ones(len(ind)), z, trend])
+    Xq = X.reshape(nq, 3, X.shape[1]).mean(axis=1)
+    rhs = np.column_stack([Xq, y])
 
-    nq = len(usable_q)
-    nm = 3 * nq
-    C = np.zeros((nq, nm))
-    for i in range(nq):
-        C[i, 3*i:3*i+3] = 1.0 / 3.0
-    Xq = C @ X
+    # The lag structure does not depend on rho: precompute it once, then each
+    # likelihood evaluation only builds a small power table and gathers from it.
+    lag_q = q_start[:, None] - q_start[None, :]
+    uniq, inv = np.unique(lag_q, return_inverse=True)
+    expo_u = np.abs(uniq[:, None] + _CL_D[None, :])
+    max_e = int(expo_u.max())
+    inv = inv.reshape(lag_q.shape)
 
-    best = None
-    for rho in np.linspace(-0.90, 0.98, 189):
-        V = _ar1_cov(nm, float(rho))
-        Vq = C @ V @ C.T
+    def cov_q(rho: float) -> np.ndarray:
+        pw = np.power(rho, np.arange(max_e + 1, dtype=float))
+        vals = (pw[expo_u] * _CL_W).sum(axis=1) / 9.0
+        return vals[inv]
+
+    def fit(rho: float):
+        Vq = cov_q(rho)
         try:
-            Vinv = np.linalg.inv(Vq)
-            beta = np.linalg.solve(Xq.T @ Vinv @ Xq, Xq.T @ Vinv @ y)
-            resid = y - Xq @ beta
-            sigma2 = float(resid.T @ Vinv @ resid) / nq
-            sign, logdet = np.linalg.slogdet(Vq)
-            if sign <= 0 or sigma2 <= 0 or not np.isfinite(sigma2):
-                continue
-            score = -0.5 * (nq * np.log(sigma2) + logdet)
-            if best is None or score > best[0]:
-                best = (score, float(rho), beta, V, Vq)
+            L = np.linalg.cholesky(Vq)
         except np.linalg.LinAlgError:
-            continue
+            return None
+        W = np.linalg.solve(L, rhs)            # whitened [Xq | y]
+        Wx, wy = W[:, :-1], W[:, -1]
+        beta, *_ = np.linalg.lstsq(Wx, wy, rcond=None)
+        resid = wy - Wx @ beta
+        sigma2 = float(resid @ resid) / nq
+        if not np.isfinite(sigma2) or sigma2 <= 0:
+            return None
+        logdet = 2.0 * float(np.log(np.diag(L)).sum())
+        return -0.5 * (nq * np.log(sigma2) + logdet), beta, Vq
 
+    lo, hi = -0.90, 0.98
+    best = None
+    for rho in np.linspace(lo, hi, 189):
+        res = fit(float(rho))
+        if res is not None and (best is None or res[0] > best[0]):
+            best = (res[0], float(rho), res[1], res[2])
     if best is None:
         raise DataError("Chow-Lin estimation failed numerically; use Linear interpolation.")
 
-    _, rho, beta, V, Vq = best
+    if refine:
+        step = (hi - lo) / 188
+        a, b = max(lo, best[1] - step), min(hi, best[1] + step)
+        g = (np.sqrt(5.0) - 1.0) / 2.0
+        def score(r):
+            res = fit(r)
+            return -np.inf if res is None else res[0]
+        c, d = b - g * (b - a), a + g * (b - a)
+        fc, fd = score(c), score(d)
+        for _ in range(30):
+            if fc > fd:
+                b, d, fd = d, c, fc
+                c = b - g * (b - a)
+                fc = score(c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + g * (b - a)
+                fd = score(d)
+        r_star = (a + b) / 2.0
+        res = fit(r_star)
+        if res is not None and res[0] > best[0]:
+            best = (res[0], float(r_star), res[1], res[2])
+
+    _, rho, beta, Vq = best
     base = X @ beta
-    monthly = base + V @ C.T @ np.linalg.solve(Vq, y - C @ base)
+    u = y - Xq @ beta
+    monthly = base + _chow_lin_cross(rho, m_ord, q_start) @ np.linalg.solve(Vq, u)
     out = pd.Series(monthly, index=mindex, dtype=float)
 
     check = out.groupby(out.index.asfreq("Q")).mean().reindex(pd.PeriodIndex(usable_q, freq="Q"))
@@ -644,25 +851,29 @@ def _gdp_to_frequency(q: pd.Series, freq: str, monthly_method: str, monthly_indi
         raise ValueError(freq)
     if monthly_method == "Leave blank":
         return pd.Series(dtype=float)
-    q_ts = q.copy()
-    # place quarterly observation on the final month of the quarter
-    q_ts.index = q_ts.index.asfreq("M", how="end")
-    full = pd.period_range(q_ts.index.min().asfreq("M", how="start") - 2,
-                           q_ts.index.max(), freq="M")
-    m = q_ts.reindex(full)
+    q = q.dropna().sort_index()
+    if q.empty:
+        return pd.Series(dtype=float)
+    full = pd.period_range(q.index.min().asfreq("M", how="start"),
+                           q.index.max().asfreq("M", how="end"), freq="M")
     if monthly_method == "Quarterly step (repeat within quarter)":
         # Each quarter's GDP level is repeated for its three constituent months.
-        out = pd.Series(index=full, dtype=float)
+        out = pd.Series(np.nan, index=full, dtype=float)
         for qp, val in q.items():
-            months = pd.period_range(qp.asfreq("M", "start"), qp.asfreq("M", "end"), freq="M")
-            out.loc[months] = val
+            first = qp.asfreq("M", "start")
+            out.loc[[first, first + 1, first + 2]] = val
         return out
     if monthly_method == "Chow-Lin (industrial production)":
         if monthly_indicator is None or monthly_indicator.dropna().empty:
             raise DataError("Chow-Lin requires monthly industrial production as an indicator.")
         return _chow_lin_monthly(q, monthly_indicator)
     if monthly_method == "Linear interpolation":
-        return m.interpolate(method="linear").bfill()
+        # A quarterly flow level is centred on the middle month of its quarter
+        # (placing it on the last month would shift GDP one month late), then
+        # interpolated linearly; the outer half-quarters hold the edge value.
+        mid = pd.Series(q.to_numpy(dtype=float),
+                        index=pd.PeriodIndex([p.asfreq("M", "start") + 1 for p in q.index], freq="M"))
+        return mid.reindex(full).interpolate(method="linear", limit_area="inside").ffill().bfill()
     raise ValueError(monthly_method)
 
 
@@ -777,7 +988,10 @@ def _ecb_daily_to_target(client: ECBClient, flow: str, key: str, freq: str,
     if carry_forward:
         # ECB official-rate endpoints can be change-date series. Convert them
         # to a continuous level path: unchanged days retain the previous rate.
-        daily_index = pd.date_range(f"{start_year}-01-01", f"{end_year}-12-31", freq="D")
+        # Stop at today: carrying a rate into future days would invent averages
+        # for months that have not happened yet.
+        last_day = min(pd.Timestamp(f"{end_year}-12-31"), pd.Timestamp(date.today()))
+        daily_index = pd.date_range(f"{start_year}-01-01", last_day, freq="D")
         full_index = s.index.union(daily_index).sort_values()
         s = s.reindex(full_index).ffill().reindex(daily_index)
         s = s.dropna()
@@ -806,6 +1020,7 @@ def fetch_macro_dataset(
     variables: Sequence[str] = CANONICAL_VARS,
     monthly_gdp_method: str = "Chow-Lin (industrial production)",
     client: Optional[EurostatClient] = None,
+    fred_api_key: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, List[FetchMeta]]:
     """Fetch macro data, comparing ECB Data Portal and Eurostat series.
 
@@ -831,7 +1046,9 @@ def fetch_macro_dataset(
             except Exception:
                 continue
         if actual_geo == "EA_AUTO":
-            raise DataError("Could not resolve the default euro-area aggregate or fixed-composition fallbacks in Eurostat.")
+            # Eurostat unreachable: ECB series still work (they use U2); Eurostat-based
+            # series will report their own errors instead of blocking everything.
+            actual_geo = "EA20"
 
     area = _ecb_area(actual_geo, evolving_ea=requested_ea)
     data: Dict[str, pd.Series] = {}
@@ -845,203 +1062,234 @@ def fetch_macro_dataset(
                               str(s.dropna().index.max()) if not s.dropna().empty else None,
                               note))
 
+    def _fail(vars_, label, exc):
+        """A series that cannot be fetched becomes an empty, explained column."""
+        reason = redact(exc)
+        for v in vars_:
+            if v in vars_set:
+                data[v] = pd.Series(dtype=float)
+                sources[v] = f"Unavailable: {reason[:200]}"
+        if any(v in vars_set for v in vars_):
+            meta.append(FetchMeta(label, "Unavailable", "", actual_geo, "", None, reason))
+
     # HICP overall
     # Index and annual inflation are selected independently. This matters because
     # Eurostat's direct annual-rate series can have a longer history than a
     # particular index-reference-base series.
-    if "hicp_level" in vars_set:
-        ecb_hicp_idx_keys = [
-            f"M.{area}.N.000000.4.INX",
-            f"M.{area}.N.000000.4D0.INX",
-        ]
-        src, h, sid = _dual_monthly(
-            "prc_hicp_midx",
-            lambda: _fetch_hicp_level(client, actual_geo, start_m, end_m, "CP00"),
-            "ICP", ecb_hicp_idx_keys, start_m, end_m, ecb
-        )
-        data["hicp_level"] = _aggregate_monthly(h, freq, "mean")
-        sources["hicp_level"] = src
-        add_meta("HICP level", src, sid, "M", h,
-                 f"Longest/freshest equivalent series. Range: {h.dropna().index.min()} to {h.dropna().index.max()}.")
-
-    if "hicp_rate" in vars_set:
-        # Eurostat direct annual rate: all-items, percentage change vs same month previous year.
-        def eurostat_hicp_rate():
-            candidates = []
-            # Newer HICP tables can expose current and legacy unit codes; try tightly filtered forms.
-            for unit in ["RCH_A", "RCH_A_AVG", "RCH_A_PY"]:
-                candidates.append({
-                    "geo": actual_geo, "freq": "M", "unit": unit, "coicop": "CP00"
-                })
-            # Dedicated annual-rate dataset is preferred.
-            return _time_value(client.first_working("prc_hicp_manr", candidates, start_m, end_m))
-
-        # ECB annual-rate variant; if unavailable, ECB index-derived rate is a fallback candidate.
-        candidates_rate = []
-        errors_rate = []
-        try:
-            er = _series_to_monthly(eurostat_hicp_rate())
-            candidates_rate.append(("Eurostat", er, "prc_hicp_manr"))
-        except Exception as exc:
-            errors_rate.append(f"Eurostat annual rate: {exc}")
-            # Fallback: derive from Eurostat all-items index.
-            try:
-                eh = _series_to_monthly(_fetch_hicp_level(client, actual_geo, start_m, end_m, "CP00"))
-                candidates_rate.append(("Eurostat", eh.pct_change(12, fill_method=None)*100.0,
-                                        "prc_hicp_midx -> YoY"))
-            except Exception as exc2:
-                errors_rate.append(f"Eurostat index fallback: {exc2}")
-        try:
-            ec, esid = _try_ecb_monthly(
-                "ICP",
-                [f"M.{area}.N.000000.4.ANR", f"M.{area}.N.000000.4D0.ANR"],
-                start_m, end_m, ecb
+    try:
+        if "hicp_level" in vars_set:
+            ecb_hicp_idx_keys = [
+                f"M.{area}.N.000000.4.INX",
+                f"M.{area}.N.000000.4D0.INX",
+            ]
+            src, h, sid = _dual_monthly(
+                "prc_hicp_midx",
+                lambda: _fetch_hicp_level(client, actual_geo, start_m, end_m, "CP00"),
+                "ICP", ecb_hicp_idx_keys, start_m, end_m, ecb
             )
-            candidates_rate.append(("ECB", ec, esid))
-        except Exception as exc:
-            errors_rate.append(f"ECB annual rate: {exc}")
+            data["hicp_level"] = _aggregate_monthly(h, freq, "mean")
+            sources["hicp_level"] = src
+            add_meta("HICP level", src, sid, "M", h,
+                     f"Longest/freshest equivalent series. Range: {h.dropna().index.min()} to {h.dropna().index.max()}.")
+    except Exception as exc:
+        _fail(['hicp_level'], 'HICP level', exc)
+
+    try:
+        if "hicp_rate" in vars_set:
+            # Eurostat direct annual rate: all-items, percentage change vs same month previous year.
+            def eurostat_hicp_rate():
+                candidates = []
+                # Newer HICP tables can expose current and legacy unit codes; try tightly filtered forms.
+                for unit in ["RCH_A", "RCH_A_AVG", "RCH_A_PY"]:
+                    candidates.append({
+                        "geo": actual_geo, "freq": "M", "unit": unit, "coicop": "CP00"
+                    })
+                # Dedicated annual-rate dataset is preferred.
+                return _time_value(client.first_working("prc_hicp_manr", candidates, start_m, end_m))
+
+            # ECB annual-rate variant; if unavailable, ECB index-derived rate is a fallback candidate.
+            candidates_rate = []
+            errors_rate = []
             try:
-                ecidx, esid2 = _try_ecb_monthly(
+                er = _series_to_monthly(eurostat_hicp_rate())
+                candidates_rate.append(("Eurostat", er, "prc_hicp_manr"))
+            except Exception as exc:
+                errors_rate.append(f"Eurostat annual rate: {exc}")
+                # Fallback: derive from Eurostat all-items index.
+                try:
+                    eh = _series_to_monthly(_fetch_hicp_level(client, actual_geo, start_m, end_m, "CP00"))
+                    candidates_rate.append(("Eurostat", eh.pct_change(12, fill_method=None)*100.0,
+                                            "prc_hicp_midx -> YoY"))
+                except Exception as exc2:
+                    errors_rate.append(f"Eurostat index fallback: {exc2}")
+            try:
+                ec, esid = _try_ecb_monthly(
                     "ICP",
-                    [f"M.{area}.N.000000.4.INX", f"M.{area}.N.000000.4D0.INX"],
+                    [f"M.{area}.N.000000.4.ANR", f"M.{area}.N.000000.4D0.ANR"],
                     start_m, end_m, ecb
                 )
-                candidates_rate.append(("ECB", ecidx.pct_change(12, fill_method=None)*100.0,
-                                        esid2 + " -> YoY"))
-            except Exception as exc2:
-                errors_rate.append(f"ECB index fallback: {exc2}")
-        if not candidates_rate:
-            raise DataError("HICP rate: " + " | ".join(errors_rate))
-        # Annual HICP inflation is a published monthly rate, not a rate inferred
-        # from a potentially stale index-base vintage.  Select the candidate
-        # with the freshest observed month, then fill earlier gaps from other
-        # equivalent candidates.  ECB is the tie-breaker when equally fresh.
-        usable = [(source, series.dropna().sort_index(), series_id)
-                  for source, series, series_id in candidates_rate
-                  if series is not None and not series.dropna().empty]
-        usable.sort(key=lambda x: (x[1].index.max().ordinal,
-                                   1 if x[0] == "ECB" else 0,
-                                   len(x[1])), reverse=True)
-        src, hr, sid = usable[0]
-        latest_primary = hr.index.max()
-        # Only backfill history: never overwrite the freshest published value
-        # with a different source or a derived index-based annual rate.
-        for fallback_source, fallback, fallback_sid in usable[1:]:
-            earlier = fallback[fallback.index < hr.index.min()]
-            if not earlier.empty:
-                hr = pd.concat([earlier, hr]).sort_index()
-        data["hicp_rate"] = _aggregate_monthly(hr, freq, "mean")
-        sources["hicp_rate"] = f"{src} · {sid}"
-        add_meta("HICP rate", src, sid, "M", hr,
-                 f"Published annual % change; freshest source selected first. "
-                 f"Latest direct observation: {latest_primary}. "
-                 "Earlier history may be extended from an equivalent alternative source.")
+                candidates_rate.append(("ECB", ec, esid))
+            except Exception as exc:
+                errors_rate.append(f"ECB annual rate: {exc}")
+                try:
+                    ecidx, esid2 = _try_ecb_monthly(
+                        "ICP",
+                        [f"M.{area}.N.000000.4.INX", f"M.{area}.N.000000.4D0.INX"],
+                        start_m, end_m, ecb
+                    )
+                    candidates_rate.append(("ECB", ecidx.pct_change(12, fill_method=None)*100.0,
+                                            esid2 + " -> YoY"))
+                except Exception as exc2:
+                    errors_rate.append(f"ECB index fallback: {exc2}")
+            if not candidates_rate:
+                raise DataError("HICP rate: " + " | ".join(errors_rate))
+            # Annual HICP inflation is a published monthly rate, not a rate inferred
+            # from a potentially stale index-base vintage.  Select the candidate
+            # with the freshest observed month, then fill earlier gaps from other
+            # equivalent candidates.  ECB is the tie-breaker when equally fresh.
+            usable = [(source, series.dropna().sort_index(), series_id)
+                      for source, series, series_id in candidates_rate
+                      if series is not None and not series.dropna().empty]
+            usable.sort(key=lambda x: (x[1].index.max().ordinal,
+                                       1 if x[0] == "ECB" else 0,
+                                       len(x[1])), reverse=True)
+            src, hr, sid = usable[0]
+            latest_primary = hr.index.max()
+            # Only backfill history: never overwrite the freshest published value
+            # with a different source or a derived index-based annual rate.
+            for fallback_source, fallback, fallback_sid in usable[1:]:
+                earlier = fallback[fallback.index < hr.index.min()]
+                if not earlier.empty:
+                    hr = pd.concat([earlier, hr]).sort_index()
+            data["hicp_rate"] = _aggregate_monthly(hr, freq, "mean")
+            sources["hicp_rate"] = f"{src} · {sid}"
+            add_meta("HICP rate", src, sid, "M", hr,
+                     f"Published annual % change; freshest source selected first. "
+                     f"Latest direct observation: {latest_primary}. "
+                     "Earlier history may be extended from an equivalent alternative source.")
+    except Exception as exc:
+        _fail(['hicp_rate'], 'HICP rate', exc)
 
-    # Energy HICP: Eurostat is authoritative mapping in the app; ECB candidate is
-    # deliberately not guessed because the ICP classification differs from Eurostat's NRG aggregate.
-    if "energy_index" in vars_set:
-        e = _series_to_monthly(_fetch_hicp_level(client, actual_geo, start_m, end_m, "NRG"))
-        data["energy_index"] = _aggregate_monthly(e, freq, "mean")
-        sources["energy_index"] = "Eurostat"
-        add_meta("Energy HICP", "Eurostat", "prc_hicp_minr (NRG)", "M", e,
-                 "Eurostat HICP energy aggregate; current ECOICOP v2 table with legacy fallback.")
+    try:
+        # Energy HICP: Eurostat is authoritative mapping in the app; ECB candidate is
+        # deliberately not guessed because the ICP classification differs from Eurostat's NRG aggregate.
+        if "energy_index" in vars_set:
+            e = _series_to_monthly(_fetch_hicp_level(client, actual_geo, start_m, end_m, "NRG"))
+            data["energy_index"] = _aggregate_monthly(e, freq, "mean")
+            sources["energy_index"] = "Eurostat"
+            add_meta("Energy HICP", "Eurostat", "prc_hicp_minr (NRG)", "M", e,
+                     "Eurostat HICP energy aggregate; current ECOICOP v2 table with legacy fallback.")
+    except Exception as exc:
+        _fail(['energy_index'], 'Energy HICP', exc)
 
-    # Residential property prices. Eurostat HPI is natively quarterly. For a monthly
-    # workbook the quarterly observation is repeated within the quarter (no invented
-    # interpolation); annual output is the arithmetic mean of the available quarters.
-    if "house_price_index" in vars_set:
-        hpi_q = _fetch_house_price_index(client, actual_geo, start_q, end_q)
-        hpi = _house_price_to_frequency(hpi_q, freq)
-        data["house_price_index"] = hpi
-        sources["house_price_index"] = "Eurostat · prc_hpi_q"
-        add_meta("House price index", "Eurostat", "prc_hpi_q (TOTAL; current base 2025=100, legacy-base fallback)", "Q", hpi_q,
-                 "Residential properties purchased by households. Current Eurostat HPI base is 2025=100; legacy index bases are accepted as fallbacks. Monthly output repeats each quarterly value within its three months; annual output averages quarters.")
+    try:
+        # Residential property prices. Eurostat HPI is natively quarterly. For a monthly
+        # workbook the quarterly observation is repeated within the quarter (no invented
+        # interpolation); annual output is the arithmetic mean of the available quarters.
+        if "house_price_index" in vars_set:
+            hpi_q = _fetch_house_price_index(client, actual_geo, start_q, end_q)
+            hpi = _house_price_to_frequency(hpi_q, freq)
+            data["house_price_index"] = hpi
+            sources["house_price_index"] = "Eurostat · prc_hpi_q"
+            add_meta("House price index", "Eurostat", "prc_hpi_q (TOTAL; current base 2025=100, legacy-base fallback)", "Q", hpi_q,
+                     "Residential properties purchased by households. Current Eurostat HPI base is 2025=100; legacy index bases are accepted as fallbacks. Monthly output repeats each quarterly value within its three months; annual output averages quarters.")
+    except Exception as exc:
+        _fail(['house_price_index'], 'House price index', exc)
 
-    # Unemployment
-    if "unemployment_rate" in vars_set:
-        ecb_unemp_keys = [
-            f"M.{area}.S.UNEH.RTT000.4.000",
-            f"M.{area}.Y.UNEH.RTT000.4.000",
-        ]
-        src, u, sid = _dual_monthly(
-            "une_rt_m", lambda: _fetch_unemployment(client, actual_geo, start_m, end_m),
-            "STS", ecb_unemp_keys, start_m, end_m, ecb
+    try:
+        # Unemployment
+        if "unemployment_rate" in vars_set:
+            ecb_unemp_keys = [
+                f"M.{area}.S.UNEH.RTT000.4.000",
+                f"M.{area}.Y.UNEH.RTT000.4.000",
+            ]
+            src, u, sid = _dual_monthly(
+                "une_rt_m", lambda: _fetch_unemployment(client, actual_geo, start_m, end_m),
+                "STS", ecb_unemp_keys, start_m, end_m, ecb
+            )
+            data["unemployment_rate"] = _aggregate_monthly(u, freq, "mean")
+            sources["unemployment_rate"] = src
+            add_meta("Unemployment rate", src, sid, "M", u,
+                     f"Selected for longest history. First observation: {u.dropna().index.min()}.")
+    except Exception as exc:
+        _fail(['unemployment_rate'], 'Unemployment rate', exc)
+
+    try:
+        # IP (also used as Chow-Lin indicator)
+        need_ip_output = bool({"ip", "log_ip"} & vars_set)
+        need_ip_for_chowlin = (
+            freq == "M" and monthly_gdp_method == "Chow-Lin (industrial production)"
+            and bool({"real_gdp", "real_gdp_growth", "log_real_gdp"} & vars_set)
         )
-        data["unemployment_rate"] = _aggregate_monthly(u, freq, "mean")
-        sources["unemployment_rate"] = src
-        add_meta("Unemployment rate", src, sid, "M", u,
-                 f"Selected for longest history. First observation: {u.dropna().index.min()}.")
+        if need_ip_output or need_ip_for_chowlin:
+            ecb_ip_keys = [
+                f"M.{area}.Y.PROD.NS0020.4.000",
+                f"M.{area}.Y.PROD.B-D.4.000",
+            ]
+            src, ip, sid = _dual_monthly(
+                "sts_inpr_m", lambda: _fetch_ip(client, actual_geo, start_m, end_m),
+                "STS", ecb_ip_keys, start_m, end_m, ecb
+            )
+            ip_monthly_indicator = ip
+            ip_indicator_source = src
+            ip_f = _aggregate_monthly(ip, freq, "mean")
+            if "ip" in vars_set:
+                data["ip"] = ip_f
+                sources["ip"] = ip_indicator_source
+            if "log_ip" in vars_set:
+                data["log_ip"] = np.log(ip_f.where(ip_f > 0))
+                sources["log_ip"] = f"Derived ({ip_indicator_source})"
+            add_meta("Industrial production", src, sid, "M", ip,
+                     f"Selected for longest history. First observation: {ip.dropna().index.min()}.")
+    except Exception as exc:
+        _fail(['ip', 'log_ip'], 'Industrial production', exc)
 
-    # IP (also used as Chow-Lin indicator)
-    need_ip_output = bool({"ip", "log_ip"} & vars_set)
-    need_ip_for_chowlin = (
-        freq == "M" and monthly_gdp_method == "Chow-Lin (industrial production)"
-        and bool({"real_gdp", "real_gdp_growth", "log_real_gdp"} & vars_set)
-    )
-    if need_ip_output or need_ip_for_chowlin:
-        ecb_ip_keys = [
-            f"M.{area}.Y.PROD.NS0020.4.000",
-            f"M.{area}.Y.PROD.B-D.4.000",
-        ]
-        src, ip, sid = _dual_monthly(
-            "sts_inpr_m", lambda: _fetch_ip(client, actual_geo, start_m, end_m),
-            "STS", ecb_ip_keys, start_m, end_m, ecb
-        )
-        ip_monthly_indicator = ip
-        ip_indicator_source = src
-        ip_f = _aggregate_monthly(ip, freq, "mean")
-        if "ip" in vars_set:
-            data["ip"] = ip_f
-            sources["ip"] = ip_indicator_source
-        if "log_ip" in vars_set:
-            data["log_ip"] = np.log(ip_f.where(ip_f > 0))
-            sources["log_ip"] = f"Derived ({ip_indicator_source})"
-        add_meta("Industrial production", src, sid, "M", ip,
-                 f"Selected for longest history. First observation: {ip.dropna().index.min()}.")
-
-    # Real GDP
-    if {"real_gdp", "real_gdp_growth", "log_real_gdp"} & vars_set:
-        ecb_gdp_keys = [
-            f"Q.Y.{area}.W2.S1.S1.B.B1GQ._Z._Z._Z.EUR.LR.N",
-            f"Q.Y.{area}.W2.S1.S1.B.B1GQ._Z._Z._Z.XDC.LR.N",
-        ]
-        src, gq, sid = _dual_quarterly(
-            "namq_10_gdp", lambda: _fetch_gdp_q(client, actual_geo, start_q, end_q),
-            "MNA", ecb_gdp_keys, start_q, end_q, ecb
-        )
-        gf = _gdp_to_frequency(gq, freq, monthly_gdp_method, monthly_indicator=ip_monthly_indicator)
-        base_source = src
-        if freq == "M" and monthly_gdp_method == "Chow-Lin (industrial production)":
-            base_source = f"Chow-Lin ({base_source}+{ip_indicator_source})"
-        elif freq == "M":
-            base_source = f"{monthly_gdp_method} ({base_source})"
-        if "real_gdp" in vars_set:
-            data["real_gdp"] = gf
-            sources["real_gdp"] = base_source
-        if "log_real_gdp" in vars_set:
-            data["log_real_gdp"] = np.log(gf.where(gf > 0))
-            sources["log_real_gdp"] = f"Derived ({base_source})"
-        if "real_gdp_growth" in vars_set:
-            lag = 12 if freq == "M" else 4 if freq == "Q" else 1
-            data["real_gdp_growth"] = gf.pct_change(lag, fill_method=None) * 100.0
-            sources["real_gdp_growth"] = f"Derived ({base_source})"
-        add_meta("Real GDP", src, sid, "Q", gq,
-                 f"Selected for longest history. First observation: {gq.dropna().index.min()}.")
+    try:
+        # Real GDP
+        if {"real_gdp", "real_gdp_growth", "log_real_gdp"} & vars_set:
+            ecb_gdp_keys = [
+                f"Q.Y.{area}.W2.S1.S1.B.B1GQ._Z._Z._Z.EUR.LR.N",
+                f"Q.Y.{area}.W2.S1.S1.B.B1GQ._Z._Z._Z.XDC.LR.N",
+            ]
+            src, gq, sid = _dual_quarterly(
+                "namq_10_gdp", lambda: _fetch_gdp_q(client, actual_geo, start_q, end_q),
+                "MNA", ecb_gdp_keys, start_q, end_q, ecb
+            )
+            gf = _gdp_to_frequency(gq, freq, monthly_gdp_method, monthly_indicator=ip_monthly_indicator)
+            base_source = src
+            if freq == "M" and monthly_gdp_method == "Chow-Lin (industrial production)":
+                base_source = f"Chow-Lin ({base_source}+{ip_indicator_source})"
+            elif freq == "M":
+                base_source = f"{monthly_gdp_method} ({base_source})"
+            if "real_gdp" in vars_set:
+                data["real_gdp"] = gf
+                sources["real_gdp"] = base_source
+            if "log_real_gdp" in vars_set:
+                data["log_real_gdp"] = np.log(gf.where(gf > 0))
+                sources["log_real_gdp"] = f"Derived ({base_source})"
+            if "real_gdp_growth" in vars_set:
+                lag = 12 if freq == "M" else 4 if freq == "Q" else 1
+                data["real_gdp_growth"] = gf.pct_change(lag, fill_method=None) * 100.0
+                sources["real_gdp_growth"] = f"Derived ({base_source})"
+            add_meta("Real GDP", src, sid, "Q", gq,
+                     f"Selected for longest history. First observation: {gq.dropna().index.min()}.")
+    except Exception as exc:
+        _fail(['real_gdp', 'real_gdp_growth', 'log_real_gdp'], 'Real GDP', exc)
 
     if "hy_spread" in vars_set:
         # ICE BofA Euro HY OAS is a euro-denominated market benchmark, not a
         # residence-of-issuer country spread. Never mislabel it as national HY.
         if requested_ea or str(actual_geo).startswith("EA"):
             try:
-                hy = _hy_spread_fred("BAMLHE00EHYIOAS", start_year, end_year, freq)
+                hy = _hy_spread_fred("BAMLHE00EHYIOAS", start_year, end_year, freq, fred_api_key)
                 data["hy_spread"] = hy
                 sources["hy_spread"] = "ICE BofA via FRED · BAMLHE00EHYIOAS"
                 add_meta("Euro high-yield OAS", "ICE BofA via FRED", "BAMLHE00EHYIOAS", "D", hy,
                          "Euro-denominated high-yield corporate option-adjusted spread; percentage points, period average.")
             except Exception as exc:
                 data["hy_spread"] = pd.Series(dtype=float)
-                sources["hy_spread"] = "Unavailable: " + str(exc)[:120]
-                add_meta("Euro high-yield OAS", "Unavailable", "BAMLHE00EHYIOAS", "D", data["hy_spread"], str(exc))
+                sources["hy_spread"] = "Unavailable: " + redact(exc)[:200]
+                add_meta("Euro high-yield OAS", "Unavailable", "BAMLHE00EHYIOAS", "D", data["hy_spread"], redact(exc))
         else:
             data["hy_spread"] = pd.Series(dtype=float)
             sources["hy_spread"] = "Not available as a comparable country-specific HY OAS"
@@ -1053,6 +1301,7 @@ def fetch_macro_dataset(
     # aaa_1y / aaa_10y. For individual countries, sovereign_* means that country's
     # own government yield; never silently replace it with the EA AAA curve.
     if "sovereign_10y" in vars_set:
+      try:
         if requested_ea:
             # Harmonised euro-area 10Y convergence yield.
             key10 = "M.U2.L.L40.CI.0000.EUR.N.Z"
@@ -1069,6 +1318,8 @@ def fetch_macro_dataset(
             if requested_ea else
             "Country-specific convergence-purpose 10Y government yield; distinct from the common EA AAA curve."
         )
+      except Exception as exc:
+        _fail(["sovereign_10y"], "Sovereign 10Y yield", exc)
 
     if "sovereign_1y" in vars_set:
         if requested_ea:
@@ -1125,7 +1376,7 @@ def fetch_macro_dataset(
                 else "Daily/business-day observations averaged within period."
             )
         except Exception as exc:
-            raise DataError(f"{v}: could not retrieve ECB series {flow}.{key}: {exc}")
+            _fail([v], v, DataError(f"ECB {flow}.{key}: {redact(exc)}"))
 
     # Equity indices. EURO STOXX 50 is common to the euro-area/country outputs.
     # Individual-country output additionally uses the OECD harmonised national
@@ -1138,12 +1389,16 @@ def fetch_macro_dataset(
             add_meta("EURO STOXX 50", "ECB", sx5e_sid, "M", sx5e,
                      "Historical close; average of observations through period. Quarterly/annual output is averaged from monthly observations.")
         except Exception as exc:
-            raise DataError(f"eurostoxx50: could not retrieve ECB EURO STOXX 50 series: {exc}")
+            _fail(["eurostoxx50"], "EURO STOXX 50", exc)
 
     if "country_equity_index" in vars_set and not requested_ea:
-        eq, eq_sid = _fetch_country_equity_index(actual_geo, freq, start_year, end_year)
+        try:
+            eq, eq_sid = _fetch_country_equity_index(actual_geo, freq, start_year, end_year)
+        except Exception as exc:
+            eq, eq_sid = pd.Series(dtype=float), f"Unavailable: {redact(exc)[:200]}"
         data["country_equity_index"] = eq
-        sources["country_equity_index"] = ("OECD" if not eq.empty else "Unavailable")
+        sources["country_equity_index"] = ("OECD · " + eq_sid) if not eq.empty else (
+            eq_sid if eq_sid.startswith("Unavailable") else "Unavailable: OECD returned no observations")
         _idx_name = REFERENCE_EQUITY_INDEX.get(actual_geo, "National equity index")
         add_meta(_idx_name, "OECD" if not eq.empty else "Unavailable",
                  eq_sid, "M", eq,
@@ -1160,183 +1415,284 @@ def fetch_macro_dataset(
     return out.reset_index(drop=True), meta
 
 
-# Configured by the Streamlit UI or Streamlit Cloud secrets; never logged.
-_FRED_API_KEY = None
+# ---------------------------------------------------------------------------
+# FRED (US series and ICE BofA spreads)
+# ---------------------------------------------------------------------------
+#
+# Order of attempts for every series:
+#   1. Official FRED API (api.stlouisfed.org) when a key is available.
+#   2. Keyless CSV (fred.stlouisfed.org/graph/fredgraph.csv?id=...) WITHOUT
+#      cosd/coed. Date windows on that endpoint are unreliable: windows can be
+#      ignored, a window that lands on a gap returns HTTP 404 instead of data,
+#      and windowed requests have been observed to time out from cloud hosts
+#      while plain requests succeed. The full series is small, so it is fetched
+#      once, cached, and sliced locally.
+# Both responses are validated (an HTML maintenance page can arrive with 200).
 
-def configure_fred_api_key(key: str | None):
+FRED_API_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+_FRED_KEY_RE = re.compile(r"[a-z0-9]{32}")
+_FRED_API_LIMITER = _RateLimiter(0.55)
+_FRED_CSV_LIMITER = _RateLimiter(0.35)
+
+# Backwards-compatible process default. The UI passes keys explicitly per
+# session, because a module global is shared by every visitor of a hosted app.
+_FRED_API_KEY: Optional[str] = None
+
+
+def configure_fred_api_key(key: Optional[str]):
+    """Set a process-wide default key (kept for compatibility with older UIs)."""
     global _FRED_API_KEY
-    _FRED_API_KEY = (key or "").strip() or None
+    _FRED_API_KEY = clean_fred_api_key(key)
 
 
-def _fred_series(series_id: str, start_year: int, end_year: int) -> pd.Series:
-    """Official authenticated FRED API, then keyless FRED graph CSV fallback.
+def clean_fred_api_key(key: Optional[str]) -> Optional[str]:
+    k = (key or "").strip().strip('"').strip("'")
+    return k or None
 
-    DBnomics FRED URLs were invalid and are intentionally removed.
-    """
-    import os
-    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
-    key = _FRED_API_KEY or os.environ.get("FRED_API_KEY", "").strip()
-    if key and not re.fullmatch(r"[a-z0-9]{32}", key):
-        raise DataError("FRED API key must contain 32 lowercase letters/digits; check the API key field")
 
-    def api():
-        r = requests.get("https://api.stlouisfed.org/fred/series/observations",
-                         params={"series_id": series_id, "api_key": key, "file_type": "json",
-                                 "observation_start": f"{start_year}-01-01",
-                                 "observation_end": f"{end_year}-12-31"},
-                         timeout=(4, 16))
-        r.raise_for_status()
-        rows = r.json().get("observations", [])
-        if not rows:
-            raise DataError(f"FRED API returned no observations for {series_id}")
-        dates = pd.to_datetime([x["date"] for x in rows], errors="coerce")
-        vals = pd.to_numeric(pd.Series([x.get("value") for x in rows]), errors="coerce")
-        return pd.Series(vals.to_numpy(), index=dates).dropna()
+def fred_key_problem(key: Optional[str]) -> Optional[str]:
+    """Return a human-readable problem with a key's format, or None if it looks valid."""
+    k = clean_fred_api_key(key)
+    if k is None:
+        return None
+    if not _FRED_KEY_RE.fullmatch(k):
+        return "A FRED API key is 32 characters, lowercase letters and digits only."
+    return None
 
-    def csv():
-        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
-                         params={"id": series_id, "cosd": f"{start_year}-01-01",
-                                 "coed": f"{end_year}-12-31"},
-                         timeout=(4, 10), headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        col = next((c for c in df.columns if c.upper() == series_id.upper()), None)
-        if col is None:
-            raise DataError(f"FRED CSV missing {series_id}")
-        dates = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-        vals = pd.to_numeric(df[col], errors="coerce")
-        return pd.Series(vals.to_numpy(), index=dates).dropna()
 
-    jobs = [api, csv] if key else [csv]
-    pool = ThreadPoolExecutor(max_workers=len(jobs))
-    futures = [pool.submit(job) for job in jobs]
-    errors = []
+def _resolve_fred_key(api_key: Optional[str]) -> Optional[str]:
+    k = clean_fred_api_key(api_key) or _FRED_API_KEY or clean_fred_api_key(os.environ.get("FRED_API_KEY"))
+    return k if (k and _FRED_KEY_RE.fullmatch(k)) else None
+
+
+def _fred_error_text(r: requests.Response) -> str:
     try:
-        for f in as_completed(futures, timeout=19 if key else 12):
-            try:
-                series = f.result().sort_index()
-                series = series[~series.index.isna()]
-                if not series.empty:
-                    return series
-                errors.append("Empty observations")
-            except Exception as exc:
-                errors.append(f"{type(exc).__name__}: {str(exc)[:130]}")
-    except FuturesTimeout:
-        errors.append("Provider response timeout")
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-    if not key:
-        raise DataError(f"{series_id}: FRED CSV failed ({'; '.join(errors)}). "
-                        "Add a free FRED API key in the US source settings to use the official API.")
-    raise DataError(f"{series_id}: official FRED API and CSV failed: {'; '.join(errors)}")
-
-def _hy_spread_fred(series_id: str, start_year: int, end_year: int, freq: str) -> pd.Series:
-    raw = _fred_series(series_id, start_year, end_year)
-    return _dated_to_period(raw, freq, "D")
+        js = r.json()
+        msg = js.get("error_message") or js.get("message") or ""
+    except ValueError:
+        msg = re.sub(r"<[^>]+>", " ", r.text or "")
+    msg = re.sub(r"\s+", " ", str(msg)).strip()
+    return redact(msg[:160])
 
 
-def _yahoo_market_series(symbol: str, start_year: int, end_year: int, freq: str) -> pd.Series:
-    """Download US equity benchmarks from Yahoo Finance's chart endpoint.
+def _series_from_dates(dates, values) -> pd.Series:
+    idx = pd.to_datetime(pd.Series(list(dates)), errors="coerce")
+    vals = pd.to_numeric(pd.Series(list(values)), errors="coerce")
+    s = pd.Series(vals.to_numpy(dtype=float), index=pd.DatetimeIndex(idx))
+    s = s[~s.index.isna()].dropna().sort_index()
+    return s[~s.index.duplicated(keep="last")]
 
-    FRED's public CSV endpoint can be slow/unreliable from Streamlit Cloud for
-    S&P/Dow market series. Yahoo's chart endpoint returns compact monthly bars,
-    so the app never transfers the full daily history. Monthly output is the
-    month-end close; quarterly/annual output is the arithmetic mean of those
-    monthly closes. Requests fail fast and retry briefly so the UI cannot hang
-    for minutes on an unavailable market-data host.
-    """
-    from datetime import datetime, timezone
-    from urllib.parse import quote
 
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}"
-    period1 = int(datetime(start_year, 1, 1, tzinfo=timezone.utc).timestamp())
-    # Yahoo period2 is exclusive; include the full requested final year.
-    period2 = int(datetime(end_year + 1, 1, 2, tzinfo=timezone.utc).timestamp())
-    params = {
-        "period1": period1,
-        "period2": period2,
-        "interval": "1mo",
-        "events": "history",
-        "includeAdjustedClose": "true",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Macro-Data-Updater/1.0)",
-        "Accept": "application/json,text/plain,*/*",
-    }
-    last_error = None
-    for attempt in range(3):
+def _fred_via_api(series_id: str, key: str) -> pd.Series:
+    r = _http_get(FRED_API_URL,
+                  params={"series_id": series_id, "api_key": key, "file_type": "json"},
+                  timeout=(6, 30), retries=2, limiter=_FRED_API_LIMITER, label="FRED API")
+    if r.status_code != 200:
+        detail = _fred_error_text(r)
+        raise DataError(f"API HTTP {r.status_code}" + (f" ({detail})" if detail else ""))
+    try:
+        rows = r.json().get("observations") or []
+    except ValueError:
+        raise DataError("API returned a non-JSON response")
+    s = _series_from_dates((x.get("date") for x in rows), (x.get("value") for x in rows))
+    if s.empty:
+        raise DataError("API returned no observations")
+    return s
+
+
+def _fred_via_csv(series_id: str) -> pd.Series:
+    r = _http_get(FRED_CSV_URL, params={"id": series_id},
+                  headers={"Accept": "text/csv,*/*;q=0.5"},
+                  timeout=(6, 30), retries=2, limiter=_FRED_CSV_LIMITER, label="FRED CSV")
+    if r.status_code == 404:
+        raise DataError("CSV HTTP 404 (FRED does not recognise this series id, "
+                        "or refused the request from this network)")
+    if r.status_code != 200:
+        raise DataError(f"CSV HTTP {r.status_code}")
+    text = (r.text or "").lstrip("﻿")
+    head = text[:300].lower()
+    if "<html" in head or "<!doctype" in head:
+        raise DataError("CSV request returned a web page instead of data "
+                        "(FRED maintenance page or a blocked request)")
+    try:
+        df = pd.read_csv(io.StringIO(text))
+    except Exception:
+        raise DataError("CSV response could not be parsed")
+    if df.shape[1] < 2:
+        raise DataError("CSV response has no data column")
+    col = next((c for c in df.columns if str(c).strip().upper() == series_id.upper()), df.columns[1])
+    s = _series_from_dates(df.iloc[:, 0], df[col])
+    if s.empty:
+        raise DataError("CSV contained no observations")
+    return s
+
+
+def fred_series(series_id: str, api_key: Optional[str] = None) -> pd.Series:
+    """Full history of a FRED series as a float Series on a DatetimeIndex (cached)."""
+    cached = _CACHE.get(("fred", series_id))
+    if cached is not None:
+        return cached.copy()
+    key = _resolve_fred_key(api_key)
+    errors = []
+    attempts = ([("API", lambda: _fred_via_api(series_id, key))] if key else []) + \
+               [("CSV", lambda: _fred_via_csv(series_id))]
+    for _, attempt in attempts:
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=(5, 12))
-            if r.status_code == 200:
-                payload = r.json()
-                chart = payload.get("chart", {})
-                if chart.get("error"):
-                    raise DataError(f"Yahoo Finance {symbol}: {chart['error']}")
-                results = chart.get("result") or []
-                if not results:
-                    raise DataError(f"Yahoo Finance {symbol}: no observations returned.")
-                result = results[0]
-                stamps = result.get("timestamp") or []
-                quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-                closes = quotes.get("close") or []
-                if not stamps or not closes:
-                    raise DataError(f"Yahoo Finance {symbol}: no closing-price observations returned.")
-                n = min(len(stamps), len(closes))
-                dt = pd.to_datetime(stamps[:n], unit="s", utc=True).tz_convert(None)
-                vals = pd.to_numeric(pd.Series(closes[:n]), errors="coerce").to_numpy()
-                monthly = pd.Series(vals, index=dt).dropna()
-                monthly = monthly[(monthly.index.year >= start_year) & (monthly.index.year <= end_year)]
-                monthly = pd.Series(monthly.values, index=monthly.index.to_period("M")).groupby(level=0).last()
-                if monthly.empty:
-                    raise DataError(f"Yahoo Finance {symbol}: no numeric observations returned.")
-                if freq == "M":
-                    return monthly
-                if freq == "Q":
-                    return monthly.groupby(monthly.index.asfreq("Q")).mean()
-                if freq == "A":
-                    return monthly.groupby(monthly.index.asfreq("Y")).mean()
-                raise ValueError(freq)
-            if r.status_code in (429, 500, 502, 503, 504):
-                last_error = f"HTTP {r.status_code}"
-            else:
-                raise DataError(f"Yahoo Finance {symbol} returned HTTP {r.status_code}.")
-        except DataError:
-            raise
-        except (requests.Timeout, requests.ConnectionError, ValueError, KeyError) as exc:
-            last_error = str(exc)
-        if attempt < 2:
-            time.sleep(1.0 * (2 ** attempt))
-    raise DataError(f"Yahoo Finance {symbol}: market-data request failed after retries ({last_error}).")
+            s = attempt()
+            _CACHE.set(("fred", series_id), s)
+            return s.copy()
+        except DataError as exc:
+            errors.append(redact(exc))
+        except Exception as exc:  # parsing surprises must not leak URLs either
+            errors.append(redact(type(exc).__name__))
+    hint = "" if key else " Adding a free FRED API key enables the official API route."
+    raise DataError(f"{series_id}: " + "; ".join(errors) + "." + hint)
 
-def _dated_to_period(s: pd.Series, freq: str, native: str) -> pd.Series:
-    """Convert dated US series to requested M/Q/A frequency using period averages."""
+
+def _fred_series(series_id: str, start_year: int, end_year: int,
+                 api_key: Optional[str] = None) -> pd.Series:
+    """Compatibility wrapper: FRED series restricted to a calendar-year window."""
+    s = fred_series(series_id, api_key)
+    return s[(s.index.year >= start_year) & (s.index.year <= end_year)]
+
+
+def check_fred_connection(api_key: Optional[str] = None) -> Dict[str, str]:
+    """Probe both FRED routes with a small request; never cached. For the UI."""
+    out: Dict[str, str] = {}
+    key = _resolve_fred_key(api_key)
+    problem = fred_key_problem(api_key)
+    if problem:
+        out["api"] = problem
+    elif not key:
+        out["api"] = "No key entered."
+    else:
+        try:
+            r = _http_get(FRED_API_URL, params={"series_id": "UNRATE", "api_key": key, "file_type": "json",
+                                                "sort_order": "desc", "limit": 1},
+                          timeout=(5, 15), retries=0, label="FRED API")
+            out["api"] = "OK" if r.status_code == 200 else f"HTTP {r.status_code} {_fred_error_text(r)}".strip()
+        except DataError as exc:
+            out["api"] = redact(exc)
+    try:
+        _fred_via_csv("UNRATE")
+        out["csv"] = "OK"
+    except DataError as exc:
+        out["csv"] = redact(exc)
+    return out
+
+
+def _hy_spread_fred(series_id: str, start_year: int, end_year: int, freq: str,
+                    api_key: Optional[str] = None) -> pd.Series:
+    return _to_frequency(fred_series(series_id, api_key), freq, "D")
+
+
+# ---------------------------------------------------------------------------
+# Frequency conversion for dated series
+# ---------------------------------------------------------------------------
+
+def _to_frequency(s: pd.Series, freq: str, native: str) -> pd.Series:
+    """Convert a dated series to M/Q/A periods by arithmetic averaging.
+
+    Daily/business-day data are averaged directly over each target period, so a
+    quarter is the mean of its trading days rather than of three monthly means.
+    Monthly data are averaged over the months in each quarter/year.
+    """
+    s = s.dropna()
+    if s.empty:
+        return pd.Series(dtype=float)
+    idx = pd.DatetimeIndex(s.index)
     if native == "Q":
-        q = pd.Series(s.values, index=s.index.to_period("Q")).groupby(level=0).last()
+        q = pd.Series(s.to_numpy(dtype=float), index=idx.to_period("Q")).groupby(level=0).last()
         if freq == "Q":
             return q
         if freq == "A":
             return q.groupby(q.index.asfreq("Y")).mean()
-        raise ValueError("Quarterly source requires GDP-specific monthly treatment.")
-    m = pd.Series(s.values, index=s.index.to_period("M")).groupby(level=0).mean()
-    if freq == "M":
-        return m
-    if freq == "Q":
-        return m.groupby(m.index.asfreq("Q")).mean()
-    return m.groupby(m.index.asfreq("Y")).mean()
+        raise ValueError("Quarterly source series need an explicit monthly treatment.")
+    target = {"M": "M", "Q": "Q", "A": "Y"}[freq]
+    if native == "M":
+        m = pd.Series(s.to_numpy(dtype=float), index=idx.to_period("M")).groupby(level=0).mean()
+        return m if freq == "M" else m.groupby(m.index.asfreq(target)).mean()
+    return pd.Series(s.to_numpy(dtype=float), index=idx.to_period(target)).groupby(level=0).mean()
 
+
+def _dated_to_period(s: pd.Series, freq: str, native: str) -> pd.Series:
+    """Compatibility alias for older callers."""
+    return _to_frequency(s, freq, native)
 
 
 def _daily_market_to_target(s: pd.Series, freq: str) -> pd.Series:
     """Aggregate daily market closes to the requested frequency by arithmetic mean."""
-    x = pd.Series(pd.to_numeric(s.values, errors="coerce"), index=pd.to_datetime(s.index, errors="coerce")).dropna()
-    x = x[~x.index.isna()].sort_index()
-    if freq == "M":
-        return x.groupby(x.index.to_period("M")).mean()
-    if freq == "Q":
-        return x.groupby(x.index.to_period("Q")).mean()
-    if freq == "A":
-        return x.groupby(x.index.to_period("Y")).mean()
-    raise ValueError(freq)
+    return _to_frequency(s, freq, "D")
+
+
+# ---------------------------------------------------------------------------
+# Yahoo Finance (long S&P 500 / Dow history; FRED only carries ten years)
+# ---------------------------------------------------------------------------
+
+_YAHOO_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+
+
+def _yahoo_daily_closes(symbol: str, start_year: int) -> pd.Series:
+    """Daily closes from Yahoo's chart endpoint, trying both public hosts."""
+    from datetime import datetime, timezone
+    from urllib.parse import quote
+
+    cache_key = ("yahoo", symbol, start_year)
+    cached = _CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+    params = {
+        "period1": int(datetime(start_year, 1, 1, tzinfo=timezone.utc).timestamp()),
+        "period2": int(time.time()) + 86400,
+        "interval": "1d",
+        "events": "history",
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; Macro-Data-Loader/2.0)",
+               "Accept": "application/json,text/plain,*/*"}
+    errors = []
+    for host in _YAHOO_HOSTS:
+        url = f"https://{host}/v8/finance/chart/{quote(symbol, safe='')}"
+        try:
+            r = _http_get(url, params=params, headers=headers, timeout=(5, 25), retries=1, label="Yahoo")
+        except DataError as exc:
+            errors.append(str(exc))
+            continue
+        try:
+            chart = r.json().get("chart", {})
+        except ValueError:
+            errors.append(f"HTTP {r.status_code}, non-JSON body")
+            continue
+        if r.status_code != 200 or chart.get("error"):
+            err = chart.get("error") or {}
+            errors.append(f"HTTP {r.status_code}" + (f" ({err.get('description')})" if err.get("description") else ""))
+            continue
+        result = (chart.get("result") or [{}])[0]
+        stamps = result.get("timestamp") or []
+        quote_block = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        closes = quote_block.get("close") or []
+        n = min(len(stamps), len(closes))
+        if n == 0:
+            errors.append("no observations")
+            continue
+        exch_tz = (result.get("meta") or {}).get("exchangeTimezoneName") or "America/New_York"
+        try:
+            dt = pd.to_datetime(stamps[:n], unit="s", utc=True).tz_convert(exch_tz).tz_localize(None).normalize()
+        except Exception:
+            dt = pd.to_datetime(stamps[:n], unit="s", utc=True).tz_localize(None).normalize()
+        s = _series_from_dates(dt, closes[:n])
+        if s.empty:
+            errors.append("no numeric observations")
+            continue
+        _CACHE.set(cache_key, s)
+        return s.copy()
+    raise DataError(f"Yahoo Finance {symbol}: " + "; ".join(errors))
+
+
+def _yahoo_market_series(symbol: str, start_year: int, end_year: int, freq: str) -> pd.Series:
+    """Period average of daily closes (kept for compatibility)."""
+    s = _yahoo_daily_closes(symbol, start_year)
+    return _to_frequency(s[s.index.year <= end_year], freq, "D")
 
 
 def _fetch_eurostoxx50(ecb: ECBClient, freq: str, start_year: int, end_year: int) -> tuple[pd.Series, str]:
@@ -1386,41 +1742,34 @@ def _oecd_country_equity_monthly(country: str, start_year: int, end_year: int) -
         "Accept": "text/csv,application/vnd.sdmx.data+csv;q=0.9,*/*;q=0.1",
     }
 
-    last_exc = None
-    for attempt in range(3):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=(8, 20))
-            if r.status_code == 429 or 500 <= r.status_code < 600:
-                raise requests.HTTPError(f"OECD HTTP {r.status_code}", response=r)
-            r.raise_for_status()
-            if not r.content.strip():
-                return pd.Series(dtype=float)
+    cache_key = ("oecd", key, start_year, end_year)
+    cached = _CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+    r = _http_get(url, params=params, headers=headers, timeout=(8, 30), retries=2, label=f"OECD {iso3}")
+    if r.status_code == 404 or not r.content.strip():
+        return pd.Series(dtype=float)          # OECD answers 404 when a country has no series
+    if r.status_code != 200:
+        raise DataError(f"OECD national share-price request for {iso3} returned HTTP {r.status_code}")
+    try:
+        df = pd.read_csv(io.BytesIO(r.content))
+    except Exception:
+        raise DataError(f"OECD national share-price response for {iso3} could not be parsed")
+    if df.empty:
+        return pd.Series(dtype=float)
+    # SDMX CSV normally exposes TIME_PERIOD and OBS_VALUE; tolerate casing variants.
+    cols = {str(c).upper(): c for c in df.columns}
+    tcol, vcol = cols.get("TIME_PERIOD"), cols.get("OBS_VALUE")
+    if tcol is None or vcol is None:
+        raise DataError(f"OECD national equity response has unexpected columns: {list(df.columns)[:12]}")
+    periods = pd.PeriodIndex(df[tcol].astype(str), freq="M")
+    values = pd.to_numeric(df[vcol], errors="coerce").to_numpy()
+    out = pd.Series(values, index=periods, dtype=float).dropna()
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    _CACHE.set(cache_key, out)
+    return out.copy()
 
-            df = pd.read_csv(io.BytesIO(r.content))
-            if df.empty:
-                return pd.Series(dtype=float)
 
-            # SDMX CSV normally exposes TIME_PERIOD and OBS_VALUE.  Keep the
-            # parser tolerant to casing/label variants in case OECD changes the
-            # CSV flavour while preserving the underlying SDMX dimensions.
-            cols = {str(c).upper(): c for c in df.columns}
-            tcol = cols.get("TIME_PERIOD")
-            vcol = cols.get("OBS_VALUE")
-            if tcol is None or vcol is None:
-                raise DataError(
-                    f"OECD national equity response has unexpected columns: {list(df.columns)[:12]}"
-                )
-
-            periods = pd.PeriodIndex(df[tcol].astype(str), freq="M")
-            values = pd.to_numeric(df[vcol], errors="coerce").to_numpy()
-            out = pd.Series(values, index=periods, dtype=float).dropna()
-            return out[~out.index.duplicated(keep="last")].sort_index()
-        except (requests.RequestException, DataError, ValueError, pd.errors.ParserError) as exc:
-            last_exc = exc
-            if attempt < 2:
-                time.sleep(1.5 * (2 ** attempt))
-
-    raise DataError(f"OECD national share-price request failed for {iso3}: {last_exc}")
 
 
 def _fetch_country_equity_index(country: str, freq: str, start_year: int, end_year: int) -> tuple[pd.Series, str]:
@@ -1447,211 +1796,282 @@ def _fetch_country_equity_index(country: str, freq: str, start_year: int, end_ye
     return out, f"OECD DSD_STES@DF_FINMARK 4.0 {iso3}.M.SHARE.IX"
 
 
+# ---------------------------------------------------------------------------
+# United States
+# ---------------------------------------------------------------------------
+
+GDP_VARS = {"real_gdp", "real_gdp_growth", "log_real_gdp"}
+
+# variable -> (FRED id, publisher, native frequency, note)
+_US_DIRECT = {
+    "unemployment_rate": ("UNRATE", "BLS", "M", "Civilian unemployment rate (CPS), seasonally adjusted, percent."),
+    "energy_cpi": ("CPIENGSL", "BLS", "M", "CPI-U energy index, seasonally adjusted, 1982-84=100."),
+    "fed_funds": ("FEDFUNDS", "Federal Reserve", "M", "Effective federal funds rate, monthly average of daily values, percent."),
+    "sofr": ("SOFR", "Federal Reserve Bank of New York", "D", "Secured Overnight Financing Rate, daily; averaged over each period. Starts April 2018."),
+    "treasury_1y": ("GS1", "Federal Reserve H.15", "M", "1-year Treasury constant-maturity yield, monthly average, percent."),
+    "treasury_10y": ("GS10", "Federal Reserve H.15", "M", "10-year Treasury constant-maturity yield, monthly average, percent."),
+    "hy_spread": ("BAMLH0A0HYM2", "ICE BofA via FRED", "D", "US high-yield corporate option-adjusted spread, percentage points; averaged over each period."),
+}
+_US_MARKETS = {
+    "sp500": ("^GSPC", "SP500", "S&P 500"),
+    "djia": ("^DJI", "DJIA", "Dow Jones Industrial Average"),
+}
+_US_LABELS = {
+    "real_gdp": "Real GDP", "real_gdp_growth": "Real GDP growth", "log_real_gdp": "Log real GDP",
+    "cpi_level": "CPI level", "inflation_rate": "CPI inflation", "unemployment_rate": "Unemployment rate",
+    "ip": "Industrial production", "log_ip": "Log industrial production", "energy_cpi": "Energy CPI",
+    "house_price_index": "House price index", "fed_funds": "Federal funds rate", "sofr": "SOFR",
+    "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
+    "sp500": "S&P 500", "djia": "Dow Jones Industrial Average", "hy_spread": "US high-yield OAS",
+}
+
+
+def _latest(s: pd.Series) -> Optional[str]:
+    s = s.dropna()
+    return str(s.index.max()) if not s.empty else None
+
+
+def _yoy_lag(freq: str) -> int:
+    return 12 if freq == "M" else 4 if freq == "Q" else 1
+
+
+def _market_daily(symbol: str, fred_id: str, start_year: int, api_key: Optional[str]) -> Tuple[pd.Series, str, str]:
+    """Yahoo first (full history); FRED fallback holds only the last ten years."""
+    try:
+        return _yahoo_daily_closes(symbol, max(start_year - 1, 1900)), "Yahoo Finance", symbol
+    except DataError as yahoo_error:
+        try:
+            s = fred_series(fred_id, api_key)
+            return s, "FRED (last 10 years only)", fred_id
+        except DataError as fred_error:
+            raise DataError(f"{yahoo_error} | FRED: {fred_error}")
+
+
 def fetch_us_dataset(freq: str, start_year: int, end_year: int,
                      variables: Sequence[str] = US_VARS,
-                     monthly_gdp_method: str = "Chow-Lin (industrial production)") -> Tuple[pd.DataFrame, List[FetchMeta]]:
-    """US macro dataset from official-source series distributed through FRED.
+                     monthly_gdp_method: str = "Chow-Lin (industrial production)",
+                     fred_api_key: Optional[str] = None,
+                     deadline_seconds: float = 90,
+                     progress: Optional[Callable[[float, str], None]] = None,
+                     ) -> Tuple[pd.DataFrame, List[FetchMeta]]:
+    """US macro dataset from official publishers, distributed through FRED.
 
-    Underlying publishers: BEA (real GDP), BLS (CPI/unemployment),
-    Federal Reserve (industrial production, federal funds, SOFR), and
-    U.S. Treasury/Federal Reserve H.15 (Treasury constant-maturity yields).
+    Every raw series is downloaded once (INDPRO serves both IP and the Chow-Lin
+    indicator), concurrently and politely rate-limited, then transformed. A
+    series that fails becomes an empty column whose *_source cell states why,
+    so one unavailable provider never blocks the workbook.
+
+    Definitions (identical for the euro-area side):
+      * growth and inflation are simple year-on-year percentage changes;
+      * inflation at quarterly/annual frequency is the period average of the
+        monthly year-on-year rates;
+      * daily series are averaged over the trading days of each period.
     """
-    vars_set=set(variables)
-    data={}
-    sources={}
-    meta=[]
+    requested = [v for v in dict.fromkeys(variables) if v in US_VARS]
+    vars_set = set(requested)
+    key = _resolve_fred_key(fred_api_key)
 
-    def add(var, series_id, publisher, native, note=""):
-        raw=_fred_series(series_id, start_year-1, end_year)
-        s=_dated_to_period(raw, freq, native)
-        data[var]=s
-        sources[var]=f"{publisher} via FRED · {series_id}"
-        meta.append(FetchMeta(var, publisher, series_id, "US", native,
-                              str(s.dropna().index.max()) if not s.dropna().empty else None, note))
-        return s
-
-    # Download INDPRO only when the user actually selected IP/log IP, or when
-    # monthly GDP specifically needs it as the Chow-Lin indicator. This prevents
-    # an equity-only request from making an unnecessary FRED call.
-    need_gdp = any(v in vars_set for v in ("real_gdp","real_gdp_growth","log_real_gdp"))
-    need_ip = bool({"ip", "log_ip"} & vars_set) or (
-        need_gdp and freq == "M" and monthly_gdp_method == "Chow-Lin (industrial production)"
-    )
-    ip_raw = None
-    ip_m = None
-    if need_ip:
-        ip_raw = _fred_series("INDPRO", start_year-1, end_year)
-        ip_m = pd.Series(ip_raw.values,index=ip_raw.index.to_period("M")).groupby(level=0).mean()
-
+    need_gdp = bool(GDP_VARS & vars_set)
+    chow_lin = need_gdp and freq == "M" and monthly_gdp_method == "Chow-Lin (industrial production)"
+    jobs: Dict[str, Callable[[], object]] = {}
     if need_gdp:
-        graw=_fred_series("GDPC1", start_year-1, end_year)
-        gq=pd.Series(graw.values,index=graw.index.to_period("Q")).groupby(level=0).last()
-        g=_gdp_to_frequency(gq, freq, monthly_gdp_method, ip_m)
-        if "real_gdp" in vars_set:
-            data["real_gdp"]=g; sources["real_gdp"]="BEA via FRED · GDPC1"
-        if "log_real_gdp" in vars_set:
-            data["log_real_gdp"]=np.log(g); sources["log_real_gdp"]="Derived from BEA GDPC1"
-        if "real_gdp_growth" in vars_set:
-            periods=12 if freq=="M" else 4 if freq=="Q" else 1
-            data["real_gdp_growth"]=100*(np.log(g)-np.log(g.shift(periods)))
-            sources["real_gdp_growth"]="Derived from BEA GDPC1"
-        meta.append(FetchMeta("Real GDP","BEA","GDPC1","US","Q",
-                              str(g.dropna().index.max()) if not g.dropna().empty else None,
-                              "Quarterly real GDP; monthly values use selected temporal-disaggregation method."))
-
-    if "cpi_level" in vars_set or "inflation_rate" in vars_set:
-        craw=_fred_series("CPIAUCSL", start_year-1, end_year)
-        cm=pd.Series(craw.values,index=craw.index.to_period("M")).groupby(level=0).mean()
-        c=_dated_to_period(craw,freq,"M")
-        if "cpi_level" in vars_set:
-            data["cpi_level"]=c; sources["cpi_level"]="BLS via FRED · CPIAUCSL"
-        if "inflation_rate" in vars_set:
-            lag=12 if freq=="M" else 4 if freq=="Q" else 1
-            data["inflation_rate"]=100*(np.log(c)-np.log(c.shift(lag)))
-            sources["inflation_rate"]="Derived from BLS CPIAUCSL"
-        meta.append(FetchMeta("CPI","BLS","CPIAUCSL","US","M",str(c.dropna().index.max()),"Seasonally adjusted CPI-U."))
-
-    if "unemployment_rate" in vars_set: add("unemployment_rate","UNRATE","BLS","M","Seasonally adjusted unemployment rate.")
-    if "ip" in vars_set and ip_raw is not None:
-        data["ip"]=_dated_to_period(ip_raw,freq,"M"); sources["ip"]="Federal Reserve via FRED · INDPRO"
-        meta.append(FetchMeta("Industrial production","Federal Reserve","INDPRO","US","M",str(data["ip"].dropna().index.max()),"Industrial Production Index."))
-    if "log_ip" in vars_set and ip_raw is not None:
-        data["log_ip"]=np.log(_dated_to_period(ip_raw,freq,"M")); sources["log_ip"]="Derived from Federal Reserve INDPRO"
-    if "energy_cpi" in vars_set: add("energy_cpi","CPIENGSL","BLS","M","CPI energy index, seasonally adjusted.")
+        jobs["GDPC1"] = lambda: fred_series("GDPC1", key)
+    if {"ip", "log_ip"} & vars_set or chow_lin:
+        jobs["INDPRO"] = lambda: fred_series("INDPRO", key)
+    if {"cpi_level", "inflation_rate"} & vars_set:
+        jobs["CPIAUCSL"] = lambda: fred_series("CPIAUCSL", key)
     if "house_price_index" in vars_set:
-        try:
-            hraw = _fred_series("USSTHPI", start_year-1, end_year)
-            hq = pd.Series(hraw.values, index=hraw.index.to_period("Q")).groupby(level=0).last()
-            h = _house_price_to_frequency(hq, freq)
-            data["house_price_index"] = h
-            sources["house_price_index"] = "FHFA via FRED · USSTHPI"
-            meta.append(FetchMeta("House price index", "FHFA via FRED", "USSTHPI", "US", "Q",
-                                  str(hq.dropna().index.max()) if not hq.dropna().empty else None,
-                                  "FHFA All-Transactions HPI; quarterly native, repeated in monthly output."))
-        except Exception as exc:
-            data["house_price_index"] = pd.Series(dtype=float)
-            sources["house_price_index"] = "Unavailable: " + str(exc)[:120]
-            meta.append(FetchMeta("House price index", "Unavailable", "USSTHPI", "US", "Q", None,
-                                  f"Download failed without blocking other selected series: {exc}"))
-    if "fed_funds" in vars_set: add("fed_funds","FEDFUNDS","Federal Reserve","M","Effective federal funds rate.")
-    if "sofr" in vars_set: add("sofr","SOFR","Federal Reserve Bank of New York","M","Secured Overnight Financing Rate.")
-    if "treasury_1y" in vars_set: add("treasury_1y","GS1","U.S. Treasury / Federal Reserve","M","1-year Treasury constant maturity rate.")
-    if "treasury_10y" in vars_set: add("treasury_10y","GS10","U.S. Treasury / Federal Reserve","M","10-year Treasury constant maturity rate.")
+        jobs["USSTHPI"] = lambda: fred_series("USSTHPI", key)
+    for var, (sid, *_rest) in _US_DIRECT.items():
+        if var in vars_set:
+            jobs[sid] = (lambda sid=sid: fred_series(sid, key))
+    for var, (symbol, fred_id, _label) in _US_MARKETS.items():
+        if var in vars_set:
+            jobs[var] = (lambda symbol=symbol, fred_id=fred_id: _market_daily(symbol, fred_id, start_year, key))
 
-    if "hy_spread" in vars_set:
-        try:
-            hy = _hy_spread_fred("BAMLH0A0HYM2", start_year, end_year, freq)
-            data["hy_spread"] = hy
-            sources["hy_spread"] = "ICE BofA via FRED · BAMLH0A0HYM2"
-            meta.append(FetchMeta("US high-yield OAS", "ICE BofA via FRED", "BAMLH0A0HYM2", "US", "D",
-                                  str(hy.dropna().index.max()) if not hy.dropna().empty else None,
-                                  "US high-yield corporate option-adjusted spread; percentage points, period average."))
-        except Exception as exc:
-            data["hy_spread"] = pd.Series(dtype=float)
-            sources["hy_spread"] = "Unavailable: " + str(exc)[:120]
-            meta.append(FetchMeta("US high-yield OAS", "Unavailable", "BAMLH0A0HYM2", "US", "D", None, str(exc)))
+    raw: Dict[str, object] = {}
+    failed: Dict[str, str] = {}
+    if jobs:
+        pool = ThreadPoolExecutor(max_workers=min(4, len(jobs)), thread_name_prefix="us-fetch")
+        futures = {pool.submit(fn): name for name, fn in jobs.items()}
+        pending = set(futures)
+        t_end = time.monotonic() + deadline_seconds
+        while pending:
+            done, pending = _futures_wait(pending, timeout=max(0.0, t_end - time.monotonic()),
+                                          return_when="FIRST_COMPLETED")
+            if not done:
+                break
+            for fut in done:
+                name = futures[fut]
+                try:
+                    raw[name] = fut.result()
+                except Exception as exc:
+                    failed[name] = redact(exc)
+            if progress:
+                n_done = len(raw) + len(failed)
+                progress(n_done / len(jobs), f"Downloaded {n_done} of {len(jobs)} US series")
+        for fut in pending:
+            failed[futures[fut]] = f"no response within {int(deadline_seconds)}s"
+        pool.shutdown(wait=False, cancel_futures=True)
 
-    # US equity benchmarks: daily closing price indices distributed through FRED.
-    # Aggregate by arithmetic mean within month/quarter/year for consistency with
-    # the ECB EURO STOXX period-average convention.
-    for var, symbol, label in [("sp500", "^GSPC", "S&P 500"), ("djia", "^DJI", "Dow Jones Industrial Average")]:
+    data: Dict[str, pd.Series] = {}
+    sources: Dict[str, str] = {}
+    meta: List[FetchMeta] = []
+
+    def unavailable(var: str, sid: str, reason: str):
+        data[var] = pd.Series(dtype=float)
+        sources[var] = f"Unavailable: {reason[:200]}"
+        meta.append(FetchMeta(_US_LABELS.get(var, var), "Unavailable", sid, "US", "", None, reason))
+
+    ip_m = None
+    if "INDPRO" in raw:
+        ip_m = _to_frequency(raw["INDPRO"], "M", "M")
+
+    # Industrial production
+    if {"ip", "log_ip"} & vars_set:
+        if ip_m is None:
+            for v in ("ip", "log_ip"):
+                if v in vars_set:
+                    unavailable(v, "INDPRO", failed.get("INDPRO", "not downloaded"))
+        else:
+            ip_f = _aggregate_monthly(ip_m, freq, "mean")
+            if "ip" in vars_set:
+                data["ip"] = ip_f
+                sources["ip"] = "Federal Reserve G.17 via FRED · INDPRO"
+            if "log_ip" in vars_set:
+                data["log_ip"] = np.log(ip_f.where(ip_f > 0))
+                sources["log_ip"] = "Derived: ln(INDPRO)"
+            meta.append(FetchMeta("Industrial production", "Federal Reserve G.17", "INDPRO", "US", "M",
+                                  _latest(ip_m), "Industrial production index, 2017=100, seasonally adjusted."))
+
+    # Real GDP
+    if need_gdp:
+        if "GDPC1" not in raw:
+            for v in GDP_VARS & vars_set:
+                unavailable(v, "GDPC1", failed.get("GDPC1", "not downloaded"))
+        elif chow_lin and ip_m is None:
+            for v in GDP_VARS & vars_set:
+                unavailable(v, "GDPC1", "Chow-Lin needs INDPRO as indicator: " + failed.get("INDPRO", "not downloaded"))
+        else:
+            gq = _to_frequency(raw["GDPC1"], "Q", "Q")
+            try:
+                g = _gdp_to_frequency(gq, freq, monthly_gdp_method, ip_m)
+                label = "BEA via FRED · GDPC1"
+                if freq == "M":
+                    label = (f"Chow-Lin (GDPC1 + INDPRO, rho={g.attrs.get('chow_lin_rho', float('nan')):.3f})"
+                             if chow_lin else f"{monthly_gdp_method} of GDPC1")
+                if "real_gdp" in vars_set:
+                    data["real_gdp"] = g
+                    sources["real_gdp"] = label
+                if "log_real_gdp" in vars_set:
+                    data["log_real_gdp"] = np.log(g.where(g > 0))
+                    sources["log_real_gdp"] = f"Derived: ln({label})"
+                if "real_gdp_growth" in vars_set:
+                    data["real_gdp_growth"] = g.pct_change(_yoy_lag(freq), fill_method=None) * 100.0
+                    sources["real_gdp_growth"] = f"Derived: y/y % change of {label}"
+                meta.append(FetchMeta("Real GDP", "BEA", "GDPC1", "US", "Q", _latest(gq),
+                                      "Real GDP, billions of chained 2017 dollars, SAAR. "
+                                      + ("Monthly values from the selected temporal disaggregation; each quarter's "
+                                         "monthly values average to the published quarter." if freq == "M" else
+                                         "Annual values average the four quarterly levels." if freq == "A" else "")))
+            except DataError as exc:
+                for v in GDP_VARS & vars_set:
+                    unavailable(v, "GDPC1", redact(exc))
+
+    # CPI
+    if {"cpi_level", "inflation_rate"} & vars_set:
+        if "CPIAUCSL" not in raw:
+            for v in ("cpi_level", "inflation_rate"):
+                if v in vars_set:
+                    unavailable(v, "CPIAUCSL", failed.get("CPIAUCSL", "not downloaded"))
+        else:
+            cm = _to_frequency(raw["CPIAUCSL"], "M", "M")
+            if "cpi_level" in vars_set:
+                data["cpi_level"] = _aggregate_monthly(cm, freq, "mean")
+                sources["cpi_level"] = "BLS via FRED · CPIAUCSL"
+            if "inflation_rate" in vars_set:
+                infl_m = cm.pct_change(12, fill_method=None) * 100.0
+                data["inflation_rate"] = _aggregate_monthly(infl_m.dropna(), freq, "mean")
+                sources["inflation_rate"] = "Derived: 12-month % change of CPIAUCSL" + (
+                    ", averaged over the period" if freq != "M" else "")
+            meta.append(FetchMeta("CPI", "BLS", "CPIAUCSL", "US", "M", _latest(cm),
+                                  "CPI-U all items, seasonally adjusted, 1982-84=100."))
+
+    # Direct series
+    for var, (sid, publisher, native, note) in _US_DIRECT.items():
         if var not in vars_set:
             continue
-        try:
-            market = _yahoo_market_series(symbol, start_year, end_year, freq)
-            source, sid = "Yahoo Finance", symbol
-        except Exception as yahoo_error:
-            try:
-                sid = "SP500" if var == "sp500" else "DJIA"
-                market = _dated_to_period(_fred_series(sid, start_year, end_year), freq, "D")
-                source = "FRED"
-            except Exception as fred_error:
-                market = pd.Series(dtype=float)
-                source = "Unavailable"
-                sid = f"{symbol} / FRED"
-                failure = f"Yahoo: {yahoo_error}; FRED: {fred_error}"
-        data[var] = market
-        sources[var] = f"{source} · {sid}" if not market.empty else "Unavailable"
-        meta.append(FetchMeta(label, source, sid, "US", "M",
-                              str(market.dropna().index.max()) if not market.dropna().empty else None,
-                              ("Monthly market values, aggregated to requested frequency."
-                               if not market.empty else f"Download failed without blocking workbook: {failure}")))
-    target=_period_range(freq,start_year,end_year)
-    out=pd.DataFrame(index=target)
+        if sid not in raw:
+            unavailable(var, sid, failed.get(sid, "not downloaded"))
+            continue
+        s = _to_frequency(raw[sid], freq, native)
+        data[var] = s
+        sources[var] = f"{publisher} via FRED · {sid}" if "FRED" not in publisher else f"{publisher} · {sid}"
+        meta.append(FetchMeta(_US_LABELS[var], publisher, sid, "US", native, _latest(s), note))
+
+    # House prices (native quarterly)
+    if "house_price_index" in vars_set:
+        if "USSTHPI" not in raw:
+            unavailable("house_price_index", "USSTHPI", failed.get("USSTHPI", "not downloaded"))
+        else:
+            hq = _to_frequency(raw["USSTHPI"], "Q", "Q")
+            data["house_price_index"] = _house_price_to_frequency(hq, freq)
+            sources["house_price_index"] = "FHFA via FRED · USSTHPI"
+            meta.append(FetchMeta("House price index", "FHFA", "USSTHPI", "US", "Q", _latest(hq),
+                                  "FHFA All-Transactions HPI, 1980Q1=100, not seasonally adjusted. Monthly output "
+                                  "repeats each quarter's value; annual output averages quarters."))
+
+    # Equity indices
+    for var, (symbol, fred_id, label) in _US_MARKETS.items():
+        if var not in vars_set:
+            continue
+        if var not in raw:
+            unavailable(var, f"{symbol} / {fred_id}", failed.get(var, "not downloaded"))
+            continue
+        daily, provider, sid = raw[var]
+        s = _to_frequency(daily, freq, "D")
+        data[var] = s
+        sources[var] = f"{provider} · {sid}"
+        meta.append(FetchMeta(label, provider, sid, "US", "D", _latest(s),
+                              "Price index (no dividends); average of daily closes over each period."
+                              + (" FRED licenses only the most recent ten years of this index."
+                                 if provider.startswith("FRED") else "")))
+
+    target = _period_range(freq, start_year, end_year)
+    out = pd.DataFrame(index=target)
     for var in US_VARS:
         if var in data:
-            out[var]=data[var].reindex(target)
-            out[f"{var}_source"]=sources.get(var,"")
-    out.insert(0,"date",[_period_label(p,freq) for p in target])
-    return out.reset_index(drop=True),meta
+            out[var] = data[var].reindex(target)
+            out[f"{var}_source"] = sources.get(var, "")
+    out.insert(0, "date", [_period_label(p, freq) for p in target])
+    return out.reset_index(drop=True), meta
 
 
 def fetch_us_dataset_fast(freq, start_year, end_year, variables,
                           monthly_gdp_method="Chow-Lin (industrial production)",
-                          deadline_seconds=32):
-    """Fetch independent US variable groups concurrently with a global wait deadline.
-
-    A timed-out provider never holds up the workbook. Worker network calls have
-    their own short timeouts, and missing columns are explicitly labelled.
-    """
-    from concurrent.futures import ThreadPoolExecutor, wait
-    requested = list(dict.fromkeys(variables))
-    if not requested:
-        return fetch_us_dataset(freq, start_year, end_year, [], monthly_gdp_method)
-    groups = []
-    gdp = {"real_gdp", "real_gdp_growth", "log_real_gdp"}
-    cpi = {"cpi_level", "inflation_rate"}
-    ip = {"ip", "log_ip"}
-    for related in (gdp, cpi, ip):
-        chosen = [v for v in requested if v in related]
-        if chosen:
-            groups.append(chosen)
-    groups.extend([[v] for v in requested if v not in gdp | cpi | ip])
-    pool = ThreadPoolExecutor(max_workers=min(8, len(groups)))
-    futures = {pool.submit(fetch_us_dataset, freq, start_year, end_year,
-                           group, monthly_gdp_method): group for group in groups}
-    done, pending = wait(futures, timeout=deadline_seconds)
-    pool.shutdown(wait=False, cancel_futures=True)
-    target = _period_range(freq, start_year, end_year)
-    out = pd.DataFrame({"date": [_period_label(p, freq) for p in target]})
-    meta = []
-    for future, group in futures.items():
-        if future in done:
-            try:
-                part, partmeta = future.result()
-                for col in part.columns:
-                    if col != "date":
-                        out[col] = part[col].to_numpy()
-                meta.extend(partmeta)
-                continue
-            except Exception as exc:
-                reason = str(exc)[:240]
-        else:
-            reason = f"Source did not respond within {deadline_seconds}s global deadline"
-        for var in group:
-            out[var] = float("nan")
-            out[f"{var}_source"] = f"Unavailable: {reason}"
-            meta.append(FetchMeta(var, "Unavailable", "", "US", "",
-                                  None, reason))
-    ordered = ["date"]
-    for var in US_VARS:
-        if var in requested:
-            ordered.extend([var, f"{var}_source"])
-    return out[ordered], meta
+                          deadline_seconds=90, fred_api_key=None, progress=None):
+    """Kept for compatibility: fetch_us_dataset is now concurrent itself."""
+    return fetch_us_dataset(freq, start_year, end_year, variables, monthly_gdp_method,
+                            fred_api_key=fred_api_key, deadline_seconds=deadline_seconds,
+                            progress=progress)
 
 
 def fetch_country_panel(countries: Sequence[str], freq: str, start_year: int, end_year: int,
                         variables: Sequence[str], monthly_gdp_method: str,
-                        progress=None) -> Tuple[Dict[str, pd.DataFrame], List[FetchMeta]]:
+                        progress=None, fred_api_key: Optional[str] = None,
+                        ) -> Tuple[Dict[str, pd.DataFrame], List[FetchMeta]]:
     """Download country panels concurrently, with independent HTTP sessions."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import as_completed
     results = {}
     metas = {}
     errors = {}
     countries = list(countries)
+
     def worker(geo):
         return fetch_macro_dataset(geo, freq, start_year, end_year, variables,
-                                   monthly_gdp_method, client=EurostatClient())
+                                   monthly_gdp_method, client=EurostatClient(),
+                                   fred_api_key=fred_api_key)
+
     with ThreadPoolExecutor(max_workers=min(4, max(1, len(countries)))) as pool:
         futures = {pool.submit(worker, geo): geo for geo in countries}
         for i, future in enumerate(as_completed(futures), 1):
@@ -1659,10 +2079,60 @@ def fetch_country_panel(countries: Sequence[str], freq: str, start_year: int, en
             try:
                 results[geo], metas[geo] = future.result()
             except Exception as exc:
-                errors[geo] = str(exc)
+                errors[geo] = redact(exc)
             if progress:
-                progress(i / max(1, len(countries)), f"Completed {i}/{len(countries)} countries")
+                progress(i / max(1, len(countries)), f"Completed {i} of {len(countries)} countries")
     if errors:
         raise DataError("Country downloads failed: " + "; ".join(f"{c}: {e}" for c, e in errors.items()))
     return ({c: results[c] for c in countries},
             [item for c in countries for item in metas[c]])
+
+
+# ---------------------------------------------------------------------------
+# Output window
+# ---------------------------------------------------------------------------
+
+def label_to_period(v, freq: str) -> Optional[pd.Period]:
+    """Parse the date labels this module writes (YYYY-MM, YYYYQn / YYYYqn, YYYY)."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    if isinstance(v, pd.Period):
+        return v.asfreq({"M": "M", "Q": "Q", "A": "Y"}[freq])
+    s = str(v).strip().upper().replace("-Q", "Q").replace(" ", "")
+    try:
+        if freq == "A":
+            return pd.Period(s[:4], freq="Y")
+        if freq == "Q":
+            return pd.Period(s, freq="Q")
+        return pd.Period(s[:7], freq="M")
+    except Exception:
+        return None
+
+
+def trim_to_window(df: pd.DataFrame, freq: str, start, end, drop_empty_edges: bool = True) -> pd.DataFrame:
+    """Keep rows inside [start, end] at the output frequency.
+
+    ``start``/``end`` are calendar dates from the UI: 15 March 2001 means
+    2001-03 (monthly), 2001Q1 (quarterly) or 2001 (annual). With
+    ``drop_empty_edges`` rows before the first and after the last observation of
+    any selected series are removed, so the sheet does not end in empty months
+    that have not been published yet.
+    """
+    if df is None or df.empty or "date" not in df.columns:
+        return df
+    pfreq = {"M": "M", "Q": "Q", "A": "Y"}[freq]
+    lo, hi = pd.Period(pd.Timestamp(start), freq=pfreq), pd.Period(pd.Timestamp(end), freq=pfreq)
+    periods = df["date"].map(lambda v: label_to_period(v, freq))
+    keep = periods.map(lambda p: p is not None and lo <= p <= hi).astype(bool)
+    out = df.loc[keep]
+    if drop_empty_edges and not out.empty:
+        value_cols = [c for c in out.columns
+                      if c not in ("date", "country") and not str(c).endswith("_source")]
+        if value_cols:
+            has = out[value_cols].apply(pd.to_numeric, errors="coerce").notna().any(axis=1).to_numpy()
+            if has.any():
+                first, last = int(np.argmax(has)), len(has) - 1 - int(np.argmax(has[::-1]))
+                out = out.iloc[first:last + 1]
+            else:
+                out = out.iloc[0:0]
+    return out.reset_index(drop=True)
