@@ -61,7 +61,7 @@ CANONICAL_VARS = [
     "unemployment_rate", "ip", "log_ip", "energy_index", "house_price_index",
     "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
     "sovereign_1y", "sovereign_10y",
-    "eurostoxx50", "country_equity_index", "hy_spread",
+    "eurostoxx50", "country_equity_index", "move", "credit_spread",
 ]
 
 US_VARS = [
@@ -69,7 +69,7 @@ US_VARS = [
     "cpi_level", "inflation_rate", "unemployment_rate",
     "ip", "log_ip", "energy_cpi", "house_price_index",
     "fed_funds", "sofr", "treasury_1y", "treasury_10y",
-    "sp500", "djia", "corp_spread", "gz_spread", "ebp", "hy_spread",
+    "sp500", "djia", "nasdaq", "vix", "credit_spread",
 ]
 
 SOURCE_URLS = {
@@ -1276,26 +1276,33 @@ def fetch_macro_dataset(
     except Exception as exc:
         _fail(['real_gdp', 'real_gdp_growth', 'log_real_gdp'], 'Real GDP', exc)
 
-    if "hy_spread" in vars_set:
-        # ICE BofA Euro HY OAS is a euro-denominated market benchmark, not a
-        # residence-of-issuer country spread. Never mislabel it as national HY.
+    if "credit_spread" in vars_set:
+        # Euro-area corporate credit spread: best of the available candidates
+        # (same rule as the US). The euro-denominated ICE index is a market-wide
+        # benchmark, so it is never relabelled as a national spread.
         if requested_ea or str(actual_geo).startswith("EA"):
-            try:
-                hy = _hy_spread_fred("BAMLHE00EHYIOAS", start_year, end_year, freq, fred_api_key)
-                data["hy_spread"] = hy
-                sources["hy_spread"] = "ICE BofA via FRED · BAMLHE00EHYIOAS"
-                add_meta("Euro high-yield OAS", "ICE BofA via FRED", "BAMLHE00EHYIOAS", "D", hy,
-                         "Euro-denominated high-yield corporate option-adjusted spread; percentage points, period average. "
-                         "Since April 2026 FRED publishes only the last three years of ICE BofA data (licence restriction).")
-            except Exception as exc:
-                data["hy_spread"] = pd.Series(dtype=float)
-                sources["hy_spread"] = "Unavailable: " + redact(exc)[:200]
-                add_meta("Euro high-yield OAS", "Unavailable", "BAMLHE00EHYIOAS", "D", data["hy_spread"], redact(exc))
+            cands, errs = [], []
+            for sid, label in (("BAMLHE00EHYIOAS", "ICE BofA euro high-yield OAS"),):
+                try:
+                    cands.append({"label": label, "sid": sid, "publisher": "ICE BofA via FRED", "native": "D",
+                                  "series": _hy_spread_fred(sid, start_year, end_year, freq, fred_api_key)})
+                except Exception as exc:
+                    errs.append(redact(exc))
+            best, summary = pick_best_source(cands, freq)
+            if best is None:
+                _fail(["credit_spread"], "Credit spread", DataError("; ".join(errs) or "no candidate returned data"))
+            else:
+                data["credit_spread"] = best["series"]
+                sources["credit_spread"] = f"{best['label']} ({best['publisher']} · {best['sid']})"
+                add_meta("Credit spread", best["publisher"], best["sid"], "D", best["series"],
+                         f"Corporate credit spread, percentage points, period average; selected {best['label']}. "
+                         f"Compared: {summary}. FRED keeps only three years of ICE BofA data since April 2026; "
+                         "no free longer euro-area corporate spread is published.")
         else:
-            data["hy_spread"] = pd.Series(dtype=float)
-            sources["hy_spread"] = "Not available as a comparable country-specific HY OAS"
-            add_meta("Country high-yield OAS", "Unavailable", "No verified national HY OAS", "D", data["hy_spread"],
-                     "No validated country-resident HY OAS from ECB/FRED. Left blank rather than substituting euro-wide spread.")
+            data["credit_spread"] = pd.Series(dtype=float)
+            sources["credit_spread"] = "Not available as a comparable country-specific corporate spread"
+            add_meta("Credit spread", "Unavailable", "", "D", data["credit_spread"],
+                     "No validated country-level corporate spread; left blank rather than substituting the euro-wide one.")
 
     # Country-specific sovereign yields.
     # For EA aggregate output the AAA curve remains available separately via
@@ -1391,6 +1398,18 @@ def fetch_macro_dataset(
                      "Historical close; average of observations through period. Quarterly/annual output is averaged from monthly observations.")
         except Exception as exc:
             _fail(["eurostoxx50"], "EURO STOXX 50", exc)
+
+    if "move" in vars_set:
+        try:
+            mv = _to_frequency(_yahoo_daily_closes("^MOVE", max(start_year - 1, 1900)), freq, "D")
+            data["move"] = mv
+            sources["move"] = "Yahoo Finance · ^MOVE"
+            add_meta("MOVE index", "Yahoo Finance", "^MOVE", "D", mv,
+                     "ICE BofA MOVE index: implied volatility of US Treasury options, basis points; average of daily "
+                     "closes. It is the standard global rates-volatility gauge and is the same series in every "
+                     "euro-area sheet. Not published on FRED.")
+        except Exception as exc:
+            _fail(["move"], "MOVE index", exc)
 
     if "country_equity_index" in vars_set and not requested_ea:
         try:
@@ -1803,6 +1822,30 @@ def _fetch_country_equity_index(country: str, freq: str, start_year: int, end_ye
 
 GDP_VARS = {"real_gdp", "real_gdp_growth", "log_real_gdp"}
 
+
+def pick_best_source(candidates: list, freq: str):
+    """Choose among equivalent candidate series: up to date first, then longest.
+
+    ``candidates`` holds dicts with label, sid, publisher and series (already at
+    the output frequency). A candidate counts as up to date when its last
+    observation is within three months (one quarter or one year at lower
+    frequencies) of the freshest candidate; among those, the longest sample
+    wins, ties going to the more recent one. Returns (best or None, summary).
+    """
+    usable = [c for c in candidates if not c["series"].dropna().empty]
+    if not usable:
+        return None, ""
+    def bounds(c):
+        x = c["series"].dropna()
+        return x.index.min(), x.index.max()
+    tol = {"M": 3, "Q": 1, "A": 1}[freq]
+    freshest = max(bounds(c)[1].ordinal for c in usable)
+    current = [c for c in usable if bounds(c)[1].ordinal >= freshest - tol]
+    best = max(current, key=lambda c: (bounds(c)[1].ordinal - bounds(c)[0].ordinal, bounds(c)[1].ordinal))
+    summary = "; ".join(f"{c['label']} ({c['sid']}): {bounds(c)[0]} to {bounds(c)[1]}"
+                        for c in sorted(usable, key=lambda c: bounds(c)[0].ordinal))
+    return best, summary
+
 # variable -> (FRED id, publisher, native frequency, note)
 _US_DIRECT = {
     "unemployment_rate": ("UNRATE", "BLS", "M", "Civilian unemployment rate (CPS), seasonally adjusted, percent."),
@@ -1811,11 +1854,12 @@ _US_DIRECT = {
     "sofr": ("SOFR", "Federal Reserve Bank of New York", "D", "Secured Overnight Financing Rate, daily; averaged over each period. Starts April 2018."),
     "treasury_1y": ("GS1", "Federal Reserve H.15", "M", "1-year Treasury constant-maturity yield, monthly average, percent."),
     "treasury_10y": ("GS10", "Federal Reserve H.15", "M", "10-year Treasury constant-maturity yield, monthly average, percent."),
-    "hy_spread": ("BAMLH0A0HYM2", "ICE BofA via FRED", "D", "US high-yield corporate option-adjusted spread, percentage points; averaged over each period. Since April 2026 FRED publishes only the last three years of ICE BofA data (licence restriction)."),
 }
-_US_MARKETS = {
-    "sp500": ("^GSPC", "SP500", "S&P 500"),
-    "djia": ("^DJI", "DJIA", "Dow Jones Industrial Average"),
+_US_MARKETS = {   # variable -> (Yahoo symbol, FRED id, label, note)
+    "sp500": ("^GSPC", "SP500", "S&P 500", "Price index (no dividends); average of daily closes. FRED carries only ten years."),
+    "djia": ("^DJI", "DJIA", "Dow Jones Industrial Average", "Price index (no dividends); average of daily closes. FRED carries only ten years."),
+    "nasdaq": ("^IXIC", "NASDAQCOM", "Nasdaq Composite", "Nasdaq Composite price index (from February 1971); average of daily closes."),
+    "vix": ("^VIX", "VIXCLS", "CBOE VIX", "CBOE Volatility Index, 30-day implied volatility of the S&P 500 (from 1990), index points; average of daily closes."),
 }
 _US_LABELS = {
     "real_gdp": "Real GDP", "real_gdp_growth": "Real GDP growth", "log_real_gdp": "Log real GDP",
@@ -1823,9 +1867,8 @@ _US_LABELS = {
     "ip": "Industrial production", "log_ip": "Log industrial production", "energy_cpi": "Energy CPI",
     "house_price_index": "House price index", "fed_funds": "Federal funds rate", "sofr": "SOFR",
     "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
-    "sp500": "S&P 500", "djia": "Dow Jones Industrial Average", "hy_spread": "US high-yield OAS",
-    "corp_spread": "Corporate spread (longest available)",
-    "gz_spread": "GZ credit spread", "ebp": "Excess bond premium",
+    "sp500": "S&P 500", "djia": "Dow Jones Industrial Average", "nasdaq": "Nasdaq Composite",
+    "vix": "CBOE VIX", "credit_spread": "Credit spread",
 }
 
 FED_EBP_URL = "https://www.federalreserve.gov/econres/notes/feds-notes/ebp_csv.csv"
@@ -1870,18 +1913,6 @@ def _yoy_lag(freq: str) -> int:
     return 12 if freq == "M" else 4 if freq == "Q" else 1
 
 
-def _market_daily(symbol: str, fred_id: str, start_year: int, api_key: Optional[str]) -> Tuple[pd.Series, str, str]:
-    """Yahoo first (full history); FRED fallback holds only the last ten years."""
-    try:
-        return _yahoo_daily_closes(symbol, max(start_year - 1, 1900)), "Yahoo Finance", symbol
-    except DataError as yahoo_error:
-        try:
-            s = fred_series(fred_id, api_key)
-            return s, "FRED (last 10 years only)", fred_id
-        except DataError as fred_error:
-            raise DataError(f"{yahoo_error} | FRED: {fred_error}")
-
-
 def fetch_us_dataset(freq: str, start_year: int, end_year: int,
                      variables: Sequence[str] = US_VARS,
                      monthly_gdp_method: str = "Chow-Lin (industrial production)",
@@ -1920,13 +1951,13 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     for var, (sid, *_rest) in _US_DIRECT.items():
         if var in vars_set:
             jobs[sid] = (lambda sid=sid: fred_series(sid, key))
-    for var, (symbol, fred_id, _label) in _US_MARKETS.items():
+    for var, (symbol, fred_id, *_rest) in _US_MARKETS.items():
         if var in vars_set:
-            jobs[var] = (lambda symbol=symbol, fred_id=fred_id: _market_daily(symbol, fred_id, start_year, key))
-    if {"gz_spread", "ebp", "corp_spread"} & vars_set:
-        jobs["FED_EBP"] = fed_gz_ebp
-    if "corp_spread" in vars_set:
+            jobs[f"yahoo:{symbol}"] = (lambda symbol=symbol: _yahoo_daily_closes(symbol, max(start_year - 1, 1900)))
+            jobs[fred_id] = (lambda fred_id=fred_id: fred_series(fred_id, key))
+    if "credit_spread" in vars_set:
         jobs["BAA10YM"] = lambda: fred_series("BAA10YM", key)
+        jobs["FED_EBP"] = fed_gz_ebp
         jobs["BAMLH0A0HYM2"] = lambda: fred_series("BAMLH0A0HYM2", key)
 
     raw: Dict[str, object] = {}
@@ -2061,73 +2092,53 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
                                   "FHFA All-Transactions HPI, 1980Q1=100, not seasonally adjusted. Monthly output "
                                   "repeats each quarter's value; annual output averages quarters."))
 
-    # Gilchrist-Zakrajsek credit spread and excess bond premium
-    for var, label, note in (
-        ("gz_spread", "GZ credit spread",
-         "Gilchrist-Zakrajsek (2012) credit spread: average spread of senior unsecured corporate bonds over "
-         "matched Treasuries, percentage points, monthly from 1973. Whole history revised monthly by the Fed."),
-        ("ebp", "Excess bond premium",
-         "Gilchrist-Zakrajsek (2012) excess bond premium: the GZ spread net of expected default risk, "
-         "percentage points, monthly from 1973. Whole history revised monthly by the Fed."),
-    ):
-        if var not in vars_set:
-            continue
-        if "FED_EBP" not in raw:
-            unavailable(var, "ebp_csv.csv", failed.get("FED_EBP", "not downloaded"))
-            continue
-        s = _to_frequency(raw["FED_EBP"][var], freq, "M")
-        data[var] = s
-        sources[var] = "Federal Reserve Board · ebp_csv.csv"
-        meta.append(FetchMeta(label, "Federal Reserve Board", "ebp_csv.csv", "US", "M", _latest(s), note))
-
-    # Corporate spread: whichever candidate covers the longest sample
-    if "corp_spread" in vars_set:
-        candidates = []   # (label, series id, publisher, series at target frequency)
+    # Credit spread: best available of three corporate-spread measures
+    if "credit_spread" in vars_set:
+        cands = []
         if "BAA10YM" in raw:
-            candidates.append(("Moody's Baa minus 10Y Treasury", "BAA10YM", "Moody's via FRED",
-                               _to_frequency(raw["BAA10YM"], freq, "M")))
+            cands.append({"label": "Moody's Baa minus 10Y Treasury", "sid": "BAA10YM", "publisher": "Moody's via FRED",
+                          "native": "M", "series": _to_frequency(raw["BAA10YM"], freq, "M")})
         if "FED_EBP" in raw:
-            candidates.append(("Gilchrist-Zakrajsek credit spread", "gz_spread", "Federal Reserve Board",
-                               _to_frequency(raw["FED_EBP"]["gz_spread"], freq, "M")))
+            cands.append({"label": "Gilchrist-Zakrajsek credit spread", "sid": "gz_spread",
+                          "publisher": "Federal Reserve Board", "native": "M",
+                          "series": _to_frequency(raw["FED_EBP"]["gz_spread"], freq, "M")})
         if "BAMLH0A0HYM2" in raw:
-            candidates.append(("ICE BofA US high-yield OAS", "BAMLH0A0HYM2", "ICE BofA via FRED",
-                               _to_frequency(raw["BAMLH0A0HYM2"], freq, "D")))
-        candidates = [c for c in candidates if not c[3].dropna().empty]
-        if not candidates:
-            reasons = "; ".join(failed.get(k, "") for k in ("BAA10YM", "FED_EBP", "BAMLH0A0HYM2") if failed.get(k))
-            unavailable("corp_spread", "BAA10YM / gz_spread / BAMLH0A0HYM2", reasons or "no candidate returned data")
+            cands.append({"label": "ICE BofA US high-yield OAS", "sid": "BAMLH0A0HYM2", "publisher": "ICE BofA via FRED",
+                          "native": "D", "series": _to_frequency(raw["BAMLH0A0HYM2"], freq, "D")})
+        best, summary = pick_best_source(cands, freq)
+        if best is None:
+            reasons = "; ".join(failed[k] for k in ("BAA10YM", "FED_EBP", "BAMLH0A0HYM2") if k in failed)
+            unavailable("credit_spread", "BAA10YM / gz_spread / BAMLH0A0HYM2", reasons or "no candidate returned data")
         else:
-            def span(c):
-                x = c[3].dropna()
-                return (x.index.max().ordinal - x.index.min().ordinal, x.index.max().ordinal)
-            best = max(candidates, key=span)
-            label, sid, publisher, s = best
-            data["corp_spread"] = s
-            sources["corp_spread"] = f"{label} ({publisher} · {sid}), longest available"
-            spans = "; ".join(f"{c[0]}: {c[3].dropna().index.min()} to {c[3].dropna().index.max()}"
-                              for c in sorted(candidates, key=span, reverse=True))
-            meta.append(FetchMeta("Corporate spread", publisher, sid, "US", "M" if sid != "BAMLH0A0HYM2" else "D",
-                                  _latest(s),
-                                  f"Longest available corporate spread, percentage points; selected: {label}. "
-                                  f"Candidates compared: {spans}. The candidates measure different bond "
-                                  "universes (Baa-rated, all senior unsecured, high-yield), so only one is used, "
-                                  "never spliced."))
+            data["credit_spread"] = best["series"]
+            sources["credit_spread"] = f"{best['label']} ({best['publisher']} · {best['sid']})"
+            meta.append(FetchMeta("Credit spread", best["publisher"], best["sid"], "US", best["native"],
+                                  _latest(best["series"]),
+                                  f"Corporate credit spread, percentage points; selected {best['label']} as the "
+                                  f"longest up-to-date candidate. Compared: {summary}. The candidates cover "
+                                  "different bonds (Baa-rated, all senior unsecured, high-yield), so one is used, "
+                                  "never spliced. FRED keeps only three years of ICE BofA data since April 2026."))
 
-    # Equity indices
-    for var, (symbol, fred_id, label) in _US_MARKETS.items():
+    # Equity and volatility indices: Yahoo and FRED compared, best one kept
+    for var, (symbol, fred_id, label, note) in _US_MARKETS.items():
         if var not in vars_set:
             continue
-        if var not in raw:
-            unavailable(var, f"{symbol} / {fred_id}", failed.get(var, "not downloaded"))
+        cands = []
+        if f"yahoo:{symbol}" in raw:
+            cands.append({"label": "Yahoo Finance", "sid": symbol, "publisher": "Yahoo Finance", "native": "D",
+                          "series": _to_frequency(raw[f"yahoo:{symbol}"], freq, "D")})
+        if fred_id in raw:
+            cands.append({"label": "FRED", "sid": fred_id, "publisher": "FRED", "native": "D",
+                          "series": _to_frequency(raw[fred_id], freq, "D")})
+        best, summary = pick_best_source(cands, freq)
+        if best is None:
+            reasons = "; ".join(failed[k] for k in (f"yahoo:{symbol}", fred_id) if k in failed)
+            unavailable(var, f"{symbol} / {fred_id}", reasons or "no source returned data")
             continue
-        daily, provider, sid = raw[var]
-        s = _to_frequency(daily, freq, "D")
-        data[var] = s
-        sources[var] = f"{provider} · {sid}"
-        meta.append(FetchMeta(label, provider, sid, "US", "D", _latest(s),
-                              "Price index (no dividends); average of daily closes over each period."
-                              + (" FRED licenses only the most recent ten years of this index."
-                                 if provider.startswith("FRED") else "")))
+        data[var] = best["series"]
+        sources[var] = f"{best['publisher']} · {best['sid']}"
+        meta.append(FetchMeta(label, best["publisher"], best["sid"], "US", "D", _latest(best["series"]),
+                              f"{note} Compared: {summary}."))
 
     target = _period_range(freq, start_year, end_year)
     out = pd.DataFrame(index=target)

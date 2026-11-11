@@ -31,12 +31,13 @@ ALIASES = {
     "energy_cpi": ["energy_cpi", "us_energy_cpi"],
     "house_price_index": ["house_price_index", "house_prices", "hpi", "residential_property_price_index"],
     "eurostoxx50": ["eurostoxx50", "euro_stoxx_50", "stoxx50", "sx5e"],
-    "hy_spread": ["hy_spread", "high_yield_spread", "corporate_hy_spread", "hy_oas"],
     "country_equity_index": ["country_equity_index", "equity_index", "share_price_index"],
     "sp500": ["sp500", "s&p500", "s_p_500"],
-    "corp_spread": ["corp_spread", "corporate_spread", "credit_spread", "baa_spread"],
-    "gz_spread": ["gz_spread", "gz"],
-    "ebp": ["ebp", "excess_bond_premium"],
+    "credit_spread": ["credit_spread", "corp_spread", "corporate_spread", "hy_spread", "high_yield_spread",
+                      "corporate_hy_spread", "hy_oas", "baa_spread"],
+    "nasdaq": ["nasdaq", "nasdaq_composite", "ixic"],
+    "vix": ["vix", "vixcls"],
+    "move": ["move", "move_index"],
     "djia": ["djia", "dow_jones", "dow_jones_industrial_average"],
 }
 

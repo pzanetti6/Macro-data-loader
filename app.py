@@ -44,7 +44,8 @@ EU_LABELS = {
     "aaa_1y": "AAA 1Y yield", "aaa_10y": "AAA 10Y yield",
     "sovereign_1y": "Sovereign 1Y yield", "sovereign_10y": "Sovereign 10Y yield",
     "eurostoxx50": "EURO STOXX 50", "country_equity_index": "National equity index",
-    "hy_spread": "High-yield spread (OAS, last 3 years)",
+    "move": "MOVE (rates volatility)",
+    "credit_spread": "Credit spread",
 }
 US_LABELS = {
     "real_gdp": "Real GDP", "real_gdp_growth": "Real GDP growth", "log_real_gdp": "Log real GDP",
@@ -53,32 +54,28 @@ US_LABELS = {
     "house_price_index": "House prices",
     "fed_funds": "Federal funds rate", "sofr": "SOFR",
     "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
-    "sp500": "S&P 500", "djia": "Dow Jones Industrial Average",
-    "hy_spread": "High-yield spread (OAS, last 3 years)",
-    "corp_spread": "Corporate spread (longest available)",
-    "gz_spread": "GZ credit spread (from 1973)",
-    "ebp": "Excess bond premium (from 1973)",
+    "sp500": "S&P 500", "djia": "Dow Jones Industrial Average", "nasdaq": "Nasdaq Composite",
+    "vix": "VIX", "credit_spread": "Credit spread",
 }
 GROUPS = {
     "US": {
         "Macro": ["real_gdp", "real_gdp_growth", "log_real_gdp", "cpi_level",
                   "inflation_rate", "unemployment_rate", "ip", "log_ip"],
-        "Rates & money": ["fed_funds", "sofr", "treasury_1y", "treasury_10y",
-                          "corp_spread", "gz_spread", "ebp", "hy_spread"],
-        "Markets & prices": ["sp500", "djia", "house_price_index", "energy_cpi"],
+        "Rates & money": ["fed_funds", "sofr", "treasury_1y", "treasury_10y", "credit_spread"],
+        "Markets & prices": ["sp500", "djia", "nasdaq", "vix", "house_price_index", "energy_cpi"],
     },
     "EU": {
         "Macro": ["real_gdp", "real_gdp_growth", "log_real_gdp", "hicp_level",
                   "hicp_rate", "unemployment_rate", "ip", "log_ip"],
         "Rates & money": ["estr", "dfr", "mro", "aaa_1y", "aaa_10y",
-                          "sovereign_1y", "sovereign_10y", "hy_spread"],
-        "Markets & prices": ["eurostoxx50", "country_equity_index", "house_price_index", "energy_index"],
+                          "sovereign_1y", "sovereign_10y", "credit_spread"],
+        "Markets & prices": ["eurostoxx50", "country_equity_index", "move", "house_price_index", "energy_index"],
     },
 }
 GROUP_HELP = {
     "Macro": "Output, prices, labour market and production.",
     "Rates & money": "Policy rates, money-market rates, government yields and credit spreads.",
-    "Markets & prices": "Equity indices, house prices and energy prices.",
+    "Markets & prices": "Equity and volatility indices, house prices and energy prices.",
 }
 
 # How each series is built, keyed by the normalised meta label.
@@ -101,7 +98,6 @@ CONSTRUCTION = {
     "ea_sovereign/convergence_10y_yield": "ECB long-term interest rate for convergence purposes (10Y), monthly; averaged for quarterly/annual output.",
     "country_sovereign_10y_yield": "ECB long-term interest rate for convergence purposes (10Y), monthly; averaged for quarterly/annual output.",
     "euro_stoxx_50": "ECB monthly EURO STOXX 50 (average of daily closes); averaged further for quarterly/annual output.",
-    "euro_high-yield_oas": "ICE BofA Euro High Yield OAS via FRED; daily values averaged over the period. FRED now carries only the last three years.",
 }
 
 
@@ -323,7 +319,8 @@ CSS = """
 header[data-testid="stHeader"] { background: transparent; }
 .hero h1 { font-family: Spectral, Georgia, serif; font-weight: 400; font-size: clamp(2.5rem, 6vw, 3.9rem);
            letter-spacing: -0.025em; line-height: 1.0; margin: 0; padding: 0; color: var(--ink); }
-.hero p { max-width: 60ch; color: var(--ink-2); font-size: 1.06rem; line-height: 1.6; margin: .9rem 0 0 0; }
+.hero a { color: var(--intaglio); text-decoration: underline; text-underline-offset: 2px; }
+.hero p { max-width: 72ch; color: var(--ink-2); font-size: 1.06rem; line-height: 1.6; margin: .9rem 0 0 0; }
 .guilloche { width: 100%; height: 112px; display: block; margin: 1.6rem 0 .5rem 0; overflow: visible; }
 .guilloche path { fill: none; stroke-width: .75; vector-effect: non-scaling-stroke;
                   stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw 2.4s cubic-bezier(.3,.6,.2,1) forwards; }
@@ -350,10 +347,9 @@ st.set_page_config(page_title="Macro Data Loader", page_icon=":material/stacked_
 st.markdown(CSS, unsafe_allow_html=True)
 st.markdown(
     '<div class="hero"><h1>Macro Data Loader</h1>'
-    "<p>Official macroeconomic series for the euro area, its member states and the United States, "
-    "brought to one frequency and delivered as an Excel workbook with the source of every column.</p></div>"
-    + guilloche_svg()
-    + '<p class="sources-line">Sources: ECB Data Portal, Eurostat, OECD, and BEA, BLS and the Federal Reserve through FRED.</p>',
+    "<p>Official macroeconomic series downloader for US, Euro Area average and single countries.<br>"
+    'Report any bug or suggestion at <a href="mailto:pzanetti@luiss.it">pzanetti@luiss.it</a></p></div>'
+    + guilloche_svg(),
     unsafe_allow_html=True,
 )
 
@@ -410,8 +406,8 @@ elif geography == "Euro area":
     # sovereign_1y has no harmonised euro-area series and would always be empty.
     available = [v for v in CANONICAL_VARS if v not in ("country_equity_index", "sovereign_1y")]
 else:
-    # No comparable country-level high-yield OAS exists; the column would be empty.
-    available = [v for v in CANONICAL_VARS if v != "hy_spread"]
+    # No comparable country-level corporate spread exists; the column would be empty.
+    available = [v for v in CANONICAL_VARS if v != "credit_spread"]
 
 selected: list = []
 for group, members in GROUPS["US" if is_us else "EU"].items():
@@ -435,7 +431,7 @@ monthly_gdp_method = GDP_METHODS[0]
 countries = list(EA19)
 panel_format = "One sheet per country"
 needs_gdp_method = freq == "M" and any(v in selected for v in ("real_gdp", "real_gdp_growth", "log_real_gdp"))
-needs_fred = is_us or "hy_spread" in selected
+needs_fred = is_us or "credit_spread" in selected
 
 if geography == "Euro-area countries":
     o1, o2 = st.columns([1.65, 1], gap="medium")
@@ -717,12 +713,18 @@ high-yield spread exists, so those are not offered.
 
 **United States.** BEA real GDP (GDPC1), BLS CPI-U (CPIAUCSL) and unemployment (UNRATE), Federal Reserve
 industrial production (INDPRO), federal funds (FEDFUNDS) and Treasury yields (GS1, GS10), FRBNY SOFR, FHFA house
-prices (USSTHPI, from 1975) and ICE BofA high-yield OAS, all through FRED. Since April 2026 FRED publishes only
-the last three years of ICE BofA spreads (US and euro). "Corporate spread (longest available)" compares the
-Moody's Baa-Treasury spread (from 1953), the Gilchrist-Zakrajšek credit spread (Federal Reserve Board, from 1973) and
-the ICE high-yield OAS, and uses the one with the longest sample; its source cell names the series chosen. The three
-are never spliced, because they cover different bonds. S&P 500 and Dow Jones come from Yahoo Finance
-because FRED licenses only their last ten years.
+prices (USSTHPI, from 1975), all through FRED.
+
+**Credit spread.** One series per economy, chosen automatically: among the candidates that are up to date (last
+observation within three months of the freshest), the one with the longest history is used and named in its source
+cell. US candidates: Moody's Baa minus 10Y Treasury (from 1953), the Gilchrist-Zakrajšek credit spread (Federal
+Reserve Board, from 1973) and the ICE BofA high-yield OAS. They cover different bonds and are never spliced. Since
+April 2026 FRED publishes only three years of ICE BofA data; for the euro area that index is the only free candidate.
+
+**Market indices.** S&P 500, Dow Jones, Nasdaq Composite and VIX are taken from Yahoo Finance or FRED, whichever
+gives the longer up-to-date history (FRED licenses only ten years of S&P 500 and Dow). MOVE, the ICE BofA index of
+US Treasury implied volatility, comes from Yahoo Finance and is offered with the euro-area datasets as the global
+rates-volatility gauge. 
 """)
     if st.button("Clear downloaded data", help="Forget the downloads kept for six hours and fetch fresh copies next time."):
         mc.clear_download_cache()
