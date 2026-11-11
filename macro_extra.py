@@ -20,7 +20,7 @@ import pandas as pd
 
 import macro_core as mc
 
-VERSION = "26.4"
+VERSION = "26.5"
 from macro_core import DataError, FetchMeta, redact
 
 # ---------------------------------------------------------------------------
@@ -753,67 +753,6 @@ def mir_firms_total(ecb, area: str) -> Tuple[pd.Series, str]:
                     f"(published: {sorted(have)[:12]})")
 
 
-def national_money(ecb, area: str, item: str) -> Tuple[pd.Series, str, str]:
-    """Published national contribution to M1/M2/M3, when the ECB has one (MFIs U or V, item or item+A)."""
-    df = ecb.frame("BSI", f"M.{area}..U+V.{item}+{item}A.X.1..2300.Z01.E")
-    counts = df.groupby("KEY")["TIME_PERIOD"].count()
-    sid = sorted(counts.index, key=lambda k: (f".{area}.Y." not in k, f".{item}." not in k, ".V." not in k,
-                                              -counts[k]))[0]
-    sub = df[df["KEY"] == sid]
-    adj = "seasonally adjusted" if f".{area}.Y." in sid else "not seasonally adjusted"
-    return (_series(sub["OBS_VALUE"], sub["TIME_PERIOD"], "M"), sid,
-            f"National contribution to euro-area {item[:2]} (currency in circulation is not allocated by country), "
-            f"million euro, {adj}; period average of month-end stocks.")
-
-
-# Deposit components of the monetary aggregates held by euro-area non-MFIs at the country's banks:
-# overnight (L21, total maturity), agreed maturity up to 2 years (L22.L), redeemable at notice up to
-# 3 months (L23.D), repurchase agreements (L24).
-_MONEY_PARTS = {"m1": [("L21", "A")], "m2": [("L21", "A"), ("L22", "L"), ("L23", "D")],
-                "m3": [("L21", "A"), ("L22", "L"), ("L23", "D"), ("L24", "A")]}
-_PART_NAMES = {"L21": "overnight deposits", "L22": "deposits with agreed maturity up to 2 years",
-               "L23": "deposits redeemable at notice up to 3 months", "L24": "repurchase agreements"}
-
-
-def deposit_money(ecb, area: str, var: str) -> Tuple[pd.Series, str, str]:
-    """Country M1/M2/M3 built from its banks' deposit liabilities to euro-area money holders.
-
-    The ECB publishes no national M1 aggregate; national contributions exclude
-    currency in circulation anyway. Money holders are non-MFIs excluding central
-    government (2300) when published, else excluding general government (2200).
-    """
-    parts = _MONEY_PARTS[var]
-    items = "+".join(sorted({i for i, _ in parts}))
-    mats = "+".join(sorted({m for _, m in parts}))
-    with _single_flight(("bsi-deposits", area)):
-        df = ecb.frame("BSI", f"M.{area}..A.L21+L22+L23+L24.A+L+D.1.U2.2300+2200.Z01.E")
-    k = df["KEY"].str.split(".")
-    df = df.assign(adj=k.str[3], item=k.str[5], mat=k.str[6], sector=k.str[9])
-    for adj in ("Y", "N"):
-        for sector in ("2300", "2200"):
-            sub = df[(df.adj == adj) & (df.sector == sector)]
-            comps = []
-            for it, mat in parts:
-                g = sub[(sub["item"] == it) & (sub["mat"] == mat)]
-                if g.empty:
-                    break
-                comps.append(_series(g["OBS_VALUE"], g["TIME_PERIOD"], "M"))
-            else:
-                s = pd.concat(comps, axis=1).dropna().sum(axis=1)
-                holders = "non-MFIs excluding central government" if sector == "2300" else \
-                          "non-MFIs excluding general government"
-                adj_txt = "seasonally adjusted" if adj == "Y" else "not seasonally adjusted"
-                sid = f"BSI.M.{area}.{adj}.A.{items}.{mats}.1.U2.{sector}.Z01.E"
-                note = (f"{var.upper()} built from deposits of euro-area {holders} at banks in {area}: "
-                        + " + ".join(_PART_NAMES[i] for i, _ in parts)
-                        + f". Million euro, {adj_txt}, period average of month-end stocks. The ECB publishes "
-                        "no national aggregate; currency in circulation is not allocated by country"
-                        + (", and money-market fund shares and short-term debt securities are not included"
-                           if var == "m3" else "") + ".")
-                return s, sid, note
-    raise DataError(f"BSI {area}: deposit components for {var.upper()} not published")
-
-
 def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int, end_year: int,
              client=None, ecb=None) -> Dict[str, Task]:
     """Tasks for the new euro-area or member-state variables in ``vars_set``.
@@ -951,18 +890,17 @@ def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int,
 
     for var, item in (("m1", "M10"), ("m2", "M20"), ("m3", "M30")):
         def build(item=item, var=var):
-            if kind == "EA":
-                k = f"M.U2.Y.V.{item}.X.1.U2.2300.Z01.E"
-                s = _ecb_monthly(ec(), "BSI", k)
-                sid = f"BSI.{k}"
-                note = (f"Euro-area {var.upper()}, outstanding amounts at month end, million euro, seasonally and "
-                        "working-day adjusted; period average.")
-            else:
-                try:
-                    s, sid, note = national_money(ec(), area, item)
-                except DataError:
-                    s, sid, note = deposit_money(ec(), area, var)
-            return _cand("ECB", sid, "ECB", convert(s, freq), "M", TIER_OFFICIAL, note)
+            # Monetary aggregates exist only for the euro area as a whole (single monetary policy);
+            # country sheets repeat the euro-area series.
+            k = f"M.U2.Y.V.{item}.X.1.U2.2300.Z01.E"
+            s = _ecb_monthly(ec(), "BSI", k)
+            note = (f"Euro-area {var.upper()}, outstanding amounts at month end, million euro, seasonally and "
+                    "working-day adjusted; period average.")
+            if kind == "CTRY":
+                note += (" The ECB publishes no national monetary aggregates, so this country sheet repeats the "
+                         "euro-area series.")
+            return _cand("ECB", f"BSI.{k}" + (" (euro area)" if kind == "CTRY" else ""), "ECB",
+                         convert(s, freq), "M", TIER_OFFICIAL, note)
         add(var, [(f"BSI {item}", build)])
 
     def mir(item, sector):
