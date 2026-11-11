@@ -351,13 +351,13 @@ def guilloche_svg(width: int = 1200, height: int = 120, strands: int = 12) -> st
 CSS = """
 <style>
 :root { --ink:#15302E; --ink-2:#4B6461; --intaglio:#0F5B52; --line:#9DBAB2; --bronze:#A07C00; --rule:#D3DDD9; }
-.block-container, [data-testid="stMainBlockContainer"] { max-width: 1080px; padding-top: 2.6rem; padding-bottom: 5rem; }
+.block-container, [data-testid="stMainBlockContainer"] { max-width: 1240px; padding-top: 2.6rem; padding-bottom: 5rem; }
 [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] { display: none; }
 header[data-testid="stHeader"] { background: transparent; }
 .hero h1 { font-family: Spectral, Georgia, serif; font-weight: 400; font-size: clamp(2.5rem, 6vw, 3.9rem);
            letter-spacing: -0.025em; line-height: 1.0; margin: 0; padding: 0; color: var(--ink); }
 .hero a { color: var(--intaglio); text-decoration: underline; text-underline-offset: 2px; }
-.hero p { max-width: 72ch; color: var(--ink-2); font-size: 1.06rem; line-height: 1.6; margin: .9rem 0 0 0; }
+.hero p { max-width: none; color: var(--ink-2); font-size: 1.06rem; line-height: 1.6; margin: .9rem 0 0 0; }
 .guilloche { width: 100%; height: 112px; display: block; margin: 1.6rem 0 .5rem 0; overflow: visible; }
 .guilloche path { fill: none; stroke-width: .75; vector-effect: non-scaling-stroke;
                   stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw 2.4s cubic-bezier(.3,.6,.2,1) forwards; }
@@ -373,6 +373,8 @@ header[data-testid="stHeader"] { background: transparent; }
 .group-name { font-weight: 600; color: var(--ink); margin-top: .3rem; }
 .group-help { color: var(--ink-2); font-size: .84rem; line-height: 1.45; margin-bottom: .6rem; }
 .group-gap { height: .35rem; }
+.country-tools { color: var(--ink-2); font-size: .88rem; white-space: nowrap; transform: translateY(-4px); }
+.st-key-countries_all button, .st-key-countries_none button, .st-key-countries_all p, .st-key-countries_none p { color: var(--intaglio) !important; font-weight: 500; }
 .group-more { color: var(--ink-2); font-size: .84rem; line-height: 1.45; margin: .15rem 0 0 .1rem; }
 .result-title { font-family: Spectral, Georgia, serif; font-weight: 500; font-size: 1.9rem; color: var(--ink); margin: 3rem 0 .2rem 0; }
 .result-sub { color: var(--ink-2); font-size: .95rem; margin-bottom: 1rem; }
@@ -409,6 +411,36 @@ with c2:
     freq_label = segmented("Frequency", list(FREQUENCIES), "Monthly", "freq_label")
 freq = FREQUENCIES[freq_label]
 is_us = geography == "United States"
+
+countries = list(EA19)
+panel_format = "One sheet per country"
+COUNTRY_ORDER = sorted(EA19, key=lambda c: COUNTRY_NAMES.get(c, c))
+
+
+def _set_countries(value):
+    st.session_state["country_pick"] = list(value)
+
+
+if geography == "Euro-area countries":
+    pick_kw = {"wrap": True} if "wrap" in _PILL_PARAMS else {}
+    if "country_pick" not in st.session_state:
+        pick_kw["default"] = COUNTRY_ORDER
+    countries = st.pills("Countries", COUNTRY_ORDER, selection_mode="multi", key="country_pick",
+                         format_func=lambda c: COUNTRY_NAMES.get(c, c), **pick_kw) or []
+    countries = [c for c in EA19 if c in countries]          # keep the usual code order in the output
+    left, right = st.columns([1.65, 1], gap="medium", vertical_alignment="center")
+    with left:
+        k1, k2, k3 = st.columns([.09, .11, 1], gap="small", vertical_alignment="center")
+        with k1:
+            st.button("All", type="tertiary", key="countries_all", on_click=_set_countries, args=(COUNTRY_ORDER,))
+        with k2:
+            st.button("None", type="tertiary", key="countries_none", on_click=_set_countries, args=([],))
+        with k3:
+            st.markdown(f'<div class="country-tools">{len(countries)} of {len(EA19)} selected</div>',
+                        unsafe_allow_html=True)
+    with right:
+        panel_format = segmented("Layout", ["One sheet per country", "Long panel"],
+                                 "One sheet per country", "panel_format", label_visibility="collapsed")
 
 c3, d1, d2 = st.columns([1.3, 1, 1], gap="medium")
 with c3:
@@ -492,19 +524,9 @@ for group, members in GROUPS["US" if is_us else "EU"].items():
 st.caption(f"{len(selected)} of {len(available)} series selected." if selected else "Nothing selected yet.")
 
 monthly_gdp_method = GDP_METHODS[0]
-countries = list(EA19)
-panel_format = "One sheet per country"
 needs_gdp_method = freq == "M" and any(v in selected for v in ("real_gdp", "real_gdp_growth", "log_real_gdp"))
 needs_fred = is_us or "credit_spread" in selected
 
-if geography == "Euro-area countries":
-    o1, o2 = st.columns([1.65, 1], gap="medium")
-    with o1:
-        countries = st.multiselect("Countries", EA19, default=EA19,
-                                   format_func=lambda x: f"{COUNTRY_NAMES.get(x, x)} ({x})")
-    with o2:
-        panel_format = segmented("Layout", ["One sheet per country", "Long panel"],
-                                 "One sheet per country", "panel_format")
 if needs_gdp_method:
     g1, _ = st.columns([1.65, 1], gap="medium")
     with g1:
@@ -794,10 +816,13 @@ high-yield spread or country SPF exists, so those are not offered.
 industrial production (INDPRO), federal funds (FEDFUNDS) and Treasury yields (GS1, GS10), FRBNY SOFR, FHFA house
 prices (USSTHPI, from 1975), all through FRED.
 
-**National accounts.** Euro area and countries: Eurostat quarterly national accounts (household and NPISH
-consumption and gross capital formation in chain-linked volumes, external balance of goods and services at current
-prices) and government net lending in % of GDP (quarterly government finance statistics; at annual frequency the
-EDP notification competes). United States: BEA real PCE (monthly from 2007, quarterly from 1947), real gross private
+**National accounts.** Euro area and countries: household and NPISH consumption and gross capital formation in
+chain-linked volumes, and the external balance of goods and services at current prices. Eurostat quarterly
+accounts, ECB main national accounts and OECD quarterly national accounts compete, and at annual frequency so do
+World Bank series (often from the 1960s; annual totals divided by four so they share the quarterly-average scale of
+real GDP). Government net lending in % of GDP comes from Eurostat quarterly government finance statistics, with the
+EDP notification and the World Bank competing at annual frequency. Reference years and currencies of
+chain-linked volumes differ across publishers, which is why sources are never spliced. United States: BEA real PCE (monthly from 2007, quarterly from 1947), real gross private
 domestic investment (government investment excluded), NIPA net exports or the monthly BOP trade balance at an annual
 rate, and the federal surplus or deficit in % of GDP by fiscal year. FDI is net inflows in % of GDP from the World
 Bank, annual everywhere.

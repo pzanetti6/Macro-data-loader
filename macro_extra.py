@@ -275,6 +275,90 @@ def _releases_to_freq(s: pd.Series, freq: str) -> pd.Series:
     return q if freq == "Q" else convert(q, "A", "mean", complete=False)
 
 
+OECD_QNA_URL = "https://sdmx.oecd.org/public/rest/data/OECD.SDD.NAD,DSD_NAMAIN1@DF_QNA,1.1/{key}"
+# FREQ.ADJUSTMENT.REF_AREA.SECTOR.COUNTERPART_SECTOR.TRANSACTION.INSTR_ASSET.ACTIVITY.
+# EXPENDITURE.UNIT_MEASURE.PRICE_BASE.TRANSFORMATION.TABLE_IDENTIFIER
+_OECD_PREFER = {"UNIT_MEASURE": ("XDC", "EUR"), "TRANSFORMATION": ("N",), "EXPENDITURE": ("_T", "_Z"),
+                "INSTR_ASSET": ("N1G", "_Z"), "ACTIVITY": ("_T", "_Z"), "COUNTERPART_SECTOR": ("S1",)}
+
+
+def oecd_qna(iso3: str, sector: str, transaction: str, price_base: str, start_year: int) -> Tuple[pd.Series, str]:
+    """One OECD quarterly national-accounts series, seasonally adjusted, national currency (million).
+
+    The key wildcards every dimension except frequency, adjustment, area,
+    sector, transaction and price base; the CSV is then narrowed to the
+    preferred codes (national currency, non-transformed, totals) and the
+    longest remaining series is kept.
+    """
+    key = ".".join(["Q", "Y", iso3, sector, "", transaction, "", "", "", "", price_base, "", ""])
+    ck = ("oecd-qna", key, start_year)
+    with _single_flight(ck):
+        cached = mc._CACHE.get(ck)
+        if cached is not None:
+            return cached[0].copy(), cached[1]
+        r = mc._http_get(OECD_QNA_URL.format(key=key),
+                         params={"startPeriod": f"{start_year - 1}-Q1", "dimensionAtObservation": "AllDimensions",
+                                 "format": "csvfile"},
+                         headers={"Accept": "text/csv,application/vnd.sdmx.data+csv;q=0.9,*/*;q=0.1"},
+                         timeout=(8, 40), retries=2, label=f"OECD QNA {iso3}")
+        if r.status_code == 404 or not r.content.strip():
+            raise DataError(f"OECD QNA {iso3} {transaction}: no matching series")
+        if r.status_code != 200:
+            raise DataError(f"OECD QNA {iso3} {transaction} returned HTTP {r.status_code}")
+        try:
+            df = pd.read_csv(io.BytesIO(r.content), dtype=str)
+        except Exception:
+            raise DataError(f"OECD QNA {iso3} {transaction}: response could not be parsed")
+        cols = {str(c).upper(): c for c in df.columns}
+        if "TIME_PERIOD" not in cols or "OBS_VALUE" not in cols:
+            raise DataError(f"OECD QNA {iso3} {transaction}: unexpected columns")
+        for dim, prefs in _OECD_PREFER.items():
+            if dim in cols:
+                present = set(df[cols[dim]].dropna())
+                keep = next((p for p in prefs if p in present), None)
+                if keep is not None:
+                    df = df[df[cols[dim]] == keep]
+        dims = [cols[c] for c in cols if c not in ("TIME_PERIOD", "OBS_VALUE", "OBS_STATUS", "UNIT_MULT",
+                                                   "DECIMALS", "CONF_STATUS", "OBS_STATUS_LABEL")
+                and not c.endswith("LABEL") and df[cols[c]].nunique() > 1]
+        if dims:
+            best = df.groupby(dims)[cols["OBS_VALUE"]].count().idxmax()
+            best = best if isinstance(best, tuple) else (best,)
+            for d, v in zip(dims, best):
+                df = df[df[d] == v]
+        s = _series(df[cols["OBS_VALUE"]], df[cols["TIME_PERIOD"]], "Q")
+        if "UNIT_MULT" in cols and not df.empty:                 # report in millions
+            mult = pd.to_numeric(df[cols["UNIT_MULT"]], errors="coerce").dropna()
+            if not mult.empty and int(mult.iloc[0]) != 6:
+                s = s * 10.0 ** (int(mult.iloc[0]) - 6)
+        if s.empty:
+            raise DataError(f"OECD QNA {iso3} {transaction}: no observations")
+        order = ["FREQ", "ADJUSTMENT", "REF_AREA", "SECTOR", "COUNTERPART_SECTOR", "TRANSACTION", "INSTR_ASSET",
+                 "ACTIVITY", "EXPENDITURE", "UNIT_MEASURE", "PRICE_BASE", "TRANSFORMATION", "TABLE_IDENTIFIER"]
+        parts = key.split(".")
+        for i, dim in enumerate(order):          # name the exact series kept, not the wildcard query
+            if dim in cols and not df.empty and df[cols[dim]].nunique() == 1:
+                parts[i] = str(df[cols[dim]].iloc[0])
+        sid = "QNA." + ".".join(parts)
+        mc._CACHE.set(ck, (s, sid))
+        return s.copy(), sid
+
+
+def ecb_mna(ecb, area: str, key_tail: str, prefer: str = "") -> Tuple[pd.Series, str]:
+    """ECB main national accounts (MNA). ``key_tail`` may contain empty (wildcard) positions."""
+    df = ecb.frame("MNA", f"Q.Y.{area}.{key_tail}")
+    keys = list(df["KEY"].unique())
+    if prefer and any(prefer in k for k in keys):
+        keys = [k for k in keys if prefer in k]
+    counts = df[df["KEY"].isin(keys)].groupby("KEY")["TIME_PERIOD"].count()
+    key = counts.idxmax()
+    sub = df[df["KEY"] == key]
+    s = _series(sub["OBS_VALUE"], sub["TIME_PERIOD"], "Q")
+    if s.empty:
+        raise DataError(f"ECB {key}: no observations")
+    return s, key
+
+
 # ---------------------------------------------------------------------------
 # Philadelphia Fed SPF
 # ---------------------------------------------------------------------------
@@ -422,7 +506,10 @@ _FREQ_WORD = {"M": "monthly", "Q": "quarterly", "A": "annual"}
 _NATIVE_WORD = {"MQA": "monthly", "QA": "quarterly", "A": "annual"}
 
 
-def _make_task(var: str, kind: str, geo_label: str, freq: str, builders: List[Tuple[str, Callable]]) -> Task:
+def _make_task(var: str, kind: str, geo_label: str, freq: str, builders: List[Tuple[str, Callable]],
+               start_year: Optional[int] = None) -> Task:
+    """``start_year``: candidates are compared on the requested window only (a source
+    that happens to return earlier history is not 'longer' where it matters)."""
     sid_all = " / ".join(sid for sid, _ in builders)
 
     def run():
@@ -434,6 +521,8 @@ def _make_task(var: str, kind: str, geo_label: str, freq: str, builders: List[Tu
         for sid, build in builders:
             try:
                 c = build()
+                if c is not None and start_year is not None:
+                    c["series"] = c["series"][c["series"].index.year >= start_year]
                 if c is not None and not c["series"].dropna().empty:
                     cands.append(c)
             except Exception as exc:
@@ -458,13 +547,13 @@ def unavailable_meta(var: str, sid: str, geo_label: str, reason: str) -> FetchMe
 # United States
 # ---------------------------------------------------------------------------
 
-def us_tasks(vars_set, freq: str, key: Optional[str]) -> Dict[str, Task]:
+def us_tasks(vars_set, freq: str, key: Optional[str], start_year: Optional[int] = None) -> Dict[str, Task]:
     """Tasks for the new US variables in ``vars_set``."""
     tasks: Dict[str, Task] = {}
 
     def add(var, builders):
         if var in vars_set:
-            tasks[var] = _make_task(var, "US", "US", freq, builders)
+            tasks[var] = _make_task(var, "US", "US", freq, builders, start_year)
 
     def fred(sid, native, how="mean", scale=1.0, label="", note="", tier=TIER_OFFICIAL, publisher="FRED"):
         def build():
@@ -594,7 +683,7 @@ def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int,
 
     def add(var, builders):
         if var in vars_set:
-            tasks[var] = _make_task(var, kind, geo, freq, builders)
+            tasks[var] = _make_task(var, kind, geo, freq, builders, start_year)
 
     def es():
         return client if client is not None else _thread_clients()[0]
@@ -602,22 +691,68 @@ def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int,
     def ec():
         return ecb if ecb is not None else _thread_clients()[1]
 
+    iso3 = WB_ISO3["EA"] if kind == "EA" else WB_ISO3.get(geo, geo)
+    oecd3 = "EA20" if kind == "EA" else mc._OECD_COUNTRY3.get(geo, geo)
+    mna_area = {"EA21": "I10", "EA20": "I9", "EA19": "I8"}.get(geo, "I9") if kind == "EA" else area
+    annual_note = (" Annual = average of quarters, so annual values are on the same quarterly scale as real GDP.")
+
     def na(item, units, note):
         def build():
             s = _eurostat_q(es(), "namq_10_gdp", _na_filters(geo, item, units), start_year, end_year)
-            return _cand("Eurostat", f"namq_10_gdp {item}", "Eurostat", convert(s, freq), "Q", TIER_OFFICIAL, note)
-        return f"namq_10_gdp {item}", build
+            return _cand("Eurostat", f"namq_10_gdp {item}", "Eurostat", convert(s, freq), "Q", TIER_OFFICIAL,
+                         note + annual_note)
+        return f"Eurostat namq_10_gdp {item}", build
+
+    def mna(key_tail, prefer, note):
+        def build():
+            s, sid = ecb_mna(ec(), mna_area, key_tail, prefer)
+            return _cand("ECB", f"MNA.{sid.split('MNA.', 1)[-1]}", "ECB", convert(s, freq), "Q", TIER_OFFICIAL,
+                         note + " ECB main national accounts (Eurostat source data)." + annual_note)
+        return "ECB MNA", build
+
+    def oecd(sector, transaction, price_base, note):
+        def build():
+            s, sid = oecd_qna(oecd3, sector, transaction, price_base, start_year)
+            return _cand("OECD", sid, "OECD", convert(s, freq), "Q", TIER_INTERNATIONAL,
+                         note + " OECD Quarterly National Accounts, national currency." + annual_note)
+        return "OECD QNA", build
+
+    def wb_level(indicator, note, scale=1e-6 / 4):
+        def build():
+            if freq != "A":
+                return None                       # annual only
+            s = world_bank(indicator, iso3) * scale
+            return _cand("World Bank", f"{indicator} ({iso3})", "World Bank", s, "A", TIER_INTERNATIONAL,
+                         note + " World Bank WDI annual total in million euro divided by four, so it is on the "
+                         "same quarterly-average scale as the other candidates and real GDP.")
+        return f"World Bank {indicator}", build
 
     volumes = ["CLV10_MEUR", "CLV20_MEUR", "CLV15_MEUR"]
-    add("consumption", [na("P31_S14_S15", volumes,
-                           "Household and NPISH final consumption expenditure, chain-linked volumes, million euro, "
-                           "seasonally and calendar adjusted. Annual = average of quarters.")])
-    add("gcf", [na("P5G", volumes, "Gross capital formation (fixed investment plus inventories, private and "
-                                   "public), chain-linked volumes, million euro, seasonally and calendar adjusted. "
-                                   "Annual = average of quarters.")])
-    add("trade_balance", [na("B11", ["CP_MEUR"], "External balance of goods and services, current prices, "
-                                                  "million euro, seasonally and calendar adjusted. Annual = average "
-                                                  "of quarters.")])
+    cons = "Household and NPISH final consumption expenditure, chain-linked volumes, million euro, seasonally " \
+           "and calendar adjusted."
+    add("consumption", [
+        na("P31_S14_S15", volumes, cons),
+        mna("W0.S1M.S1.D.P31._Z._Z._T.EUR.LR.N", "", cons),
+        oecd("S1M", "P31", "LR", "Household and NPISH final consumption expenditure, chain-linked volumes, "
+                                 "seasonally adjusted."),
+        wb_level("NE.CON.PRVT.KN", "Household and NPISH final consumption expenditure, constant prices."),
+    ])
+    gcf = "Gross capital formation (fixed investment plus inventories, private and public), chain-linked volumes, " \
+          "million euro, seasonally and calendar adjusted."
+    add("gcf", [
+        na("P5G", volumes, gcf),
+        mna("W0.S1.S1.D.P5....EUR.LR.N", ".P5.N1G.", gcf),
+        oecd("S1", "P5", "LR", "Gross capital formation, chain-linked volumes, seasonally adjusted."),
+        wb_level("NE.GDI.TOTL.KN", "Gross capital formation, constant prices."),
+    ])
+    trade = "External balance of goods and services (exports minus imports), current prices, million euro, " \
+            "seasonally and calendar adjusted."
+    add("trade_balance", [
+        na("B11", ["CP_MEUR"], trade),
+        mna(".S1.S1.B.B11._Z._Z._Z.EUR.V.N", "", trade),
+        oecd("S1", "B11", "V", "External balance of goods and services, current prices, seasonally adjusted."),
+        wb_level("NE.RSB.GNFS.CN", "External balance on goods and services, current prices."),
+    ])
 
     def gov_q():
         s = _eurostat_q(es(), "gov_10q_ggnfa",
@@ -636,9 +771,17 @@ def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int,
         return _cand("Eurostat EDP", "gov_10dd_edpt1 B9", "Eurostat", s, "A", TIER_OFFICIAL,
                      "General government net lending (+) / net borrowing (-), percent of GDP, annual "
                      "excessive-deficit-procedure notification.")
-    add("budget_balance", [("gov_10q_ggnfa B9", gov_q), ("gov_10dd_edpt1 B9", gov_a)])
 
-    iso3 = WB_ISO3["EA"] if kind == "EA" else WB_ISO3.get(geo, geo)
+    def gov_wb():
+        if freq != "A":
+            return None
+        s = world_bank("GC.NLD.TOTL.GD.ZS", iso3)
+        return _cand("World Bank", f"GC.NLD.TOTL.GD.ZS ({iso3})", "World Bank", s, "A", TIER_INTERNATIONAL,
+                     "Net lending (+) / net borrowing (-), percent of GDP (World Bank WDI, IMF government finance "
+                     "statistics; central government for some countries). Annual only.")
+    add("budget_balance", [("Eurostat gov_10q_ggnfa B9", gov_q), ("Eurostat gov_10dd_edpt1 B9", gov_a),
+                           ("World Bank GC.NLD.TOTL.GD.ZS", gov_wb)])
+
 
     def wb_fdi():
         s = world_bank("BX.KLT.DINV.WD.GD.ZS", iso3)

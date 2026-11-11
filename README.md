@@ -75,10 +75,10 @@ Do not copy or commit `.venv`: a virtual environment only works on the machine a
 
 | Series | Euro area and countries | United States |
 |---|---|---|
-| Private consumption | Eurostat `namq_10_gdp` P31_S14_S15, chain-linked volumes (Q) | BEA real PCE: PCEC96 (M, from 2007), PCECC96 (Q, from 1947) |
-| Gross capital formation | Eurostat P5G, chain-linked volumes (Q) | BEA real gross private domestic investment GPDIC1 (Q; government investment excluded) |
-| Trade balance | Eurostat B11, current prices (Q) | BOPGSTB (M, ×12/1000 = bn $ annual rate) or NIPA NETEXP (Q) |
-| Budget balance | Eurostat `gov_10q_ggnfa` B9 % GDP (Q); EDP `gov_10dd_edpt1` competes at annual frequency | Federal surplus/deficit FYFSGDA188S, % GDP, fiscal years (A) |
+| Private consumption | Eurostat `namq_10_gdp` P31_S14_S15, ECB MNA `…S1M.S1.D.P31._Z._Z._T.EUR.LR.N`, OECD QNA (Q); World Bank NE.CON.PRVT.KN (A) | BEA real PCE: PCEC96 (M, from 2007), PCECC96 (Q, from 1947) |
+| Gross capital formation | Eurostat P5G, ECB MNA P5, OECD QNA P5, chain-linked volumes (Q); World Bank NE.GDI.TOTL.KN (A) | BEA real gross private domestic investment GPDIC1 (Q; government investment excluded) |
+| Trade balance | Eurostat B11, ECB MNA B11, OECD QNA B11, current prices (Q); World Bank NE.RSB.GNFS.CN (A) | BOPGSTB (M, ×12/1000 = bn $ annual rate) or NIPA NETEXP (Q) |
+| Budget balance | Eurostat `gov_10q_ggnfa` B9 % GDP (Q); EDP `gov_10dd_edpt1` and World Bank GC.NLD.TOTL.GD.ZS compete at annual frequency | Federal surplus/deficit FYFSGDA188S, % GDP, fiscal years (A) |
 | FDI | World Bank BX.KLT.DINV.WD.GD.ZS, net inflows % GDP (A) | same (A) |
 | M1, M2, M3 | ECB BSI outstanding amounts; countries: national contributions (no currency in circulation) | M1SL, M2SL (M3 discontinued in 2006) |
 | Loans to households | ECB MIR new business: house purchase + consumer credit + other lending (from 2003) | H.8 stocks: CONSUMER + RREACBM027SBOG (no new-lending statistic exists) |
@@ -110,6 +110,12 @@ Requests are spaced to respect FRED's rate limit, retried on 429/5xx errors, and
 **Packages need refreshing.** Delete `.venv`; the next launch reinstalls everything. Otherwise packages are reinstalled only when `requirements.txt` changes.
 
 ## Changelog
+
+### v26.1
+- **Country national accounts from four publishers.** Consumption, gross capital formation and the trade balance now compare Eurostat, ECB main national accounts and OECD quarterly national accounts (World Bank too at annual frequency, with histories back to the 1960s). A country is no longer left empty when one portal fails. Candidates are compared on the requested window only.
+- **Eurostat requests retry** on throttling and server errors; a single throttled answer in a large country panel used to empty a column.
+- **Wider page**, with the subtitle on full-width lines.
+- **Country picker under Economy:** chips for the 19 countries with All and None, and the sheet layout beside them.
 
 ### v26
 - **National accounts** for the euro area, countries and the US: private consumption, gross capital formation, trade balance, budget balance and FDI.

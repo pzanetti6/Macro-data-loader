@@ -303,10 +303,9 @@ class EurostatClient:
         if cached is not None:
             return cached.copy()
         url = f"{EUROSTAT_STATS}/{dataset}"
-        try:
-            r = self.session.get(url, params=params, timeout=(5, self.timeout))
-        except requests.RequestException as exc:
-            raise DataError(f"Eurostat {dataset}: network request failed ({type(exc).__name__})") from exc
+        # Retries on 429/5xx: country panels send many Eurostat requests at once and a
+        # single throttled answer used to leave a whole column empty.
+        r = _http_get(url, params=params, timeout=(5, self.timeout), retries=2, label=f"Eurostat {dataset}")
         if r.status_code != 200:
             raise DataError(f"Eurostat {dataset} returned HTTP {r.status_code}: {r.text[:240]}")
         js = r.json()
@@ -2037,7 +2036,7 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     extra_tasks = {}
     if vars_set & set(EXTRA_US_VARS):
         import macro_extra
-        extra_tasks = macro_extra.us_tasks(vars_set & set(EXTRA_US_VARS), freq, key)
+        extra_tasks = macro_extra.us_tasks(vars_set & set(EXTRA_US_VARS), freq, key, start_year)
         for var, (_sid, fn) in extra_tasks.items():
             jobs[f"extra:{var}"] = fn
 
