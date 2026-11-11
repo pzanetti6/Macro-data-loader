@@ -12,7 +12,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-VERSION = "26.3"
+VERSION = "26.4"
 
 # Existing-file aliases observed in the user's annual and quarterly workbooks.
 # A header is updated only when it matches one of these exactly (after

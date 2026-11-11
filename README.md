@@ -80,7 +80,7 @@ Do not copy or commit `.venv`: a virtual environment only works on the machine a
 | Trade balance | Eurostat B11, ECB MNA B11, OECD QNA B11, current prices (Q); World Bank NE.RSB.GNFS.CN (A) | BOPGSTB (M, ×12/1000 = bn $ annual rate) or NIPA NETEXP (Q) |
 | Budget balance | Eurostat `gov_10q_ggnfa` B9 % GDP (Q); EDP `gov_10dd_edpt1` and World Bank GC.NLD.TOTL.GD.ZS compete at annual frequency | Federal surplus/deficit FYFSGDA188S, % GDP, fiscal years (A) |
 | FDI | World Bank BX.KLT.DINV.WD.GD.ZS, net inflows % GDP (A) | same (A) |
-| M1, M2, M3 | ECB BSI outstanding amounts; countries: national contributions (no currency in circulation) | M1SL, M2SL (M3 discontinued in 2006) |
+| M1, M2, M3 | ECB BSI outstanding amounts; countries: built from deposits of euro-area money holders at national banks (M1 overnight; M2 + agreed maturity ≤2y + notice ≤3m; M3 + repos), since no national aggregate is published | M1SL, M2SL (M3 discontinued in 2006) |
 | Loans to households | ECB MIR new business: house purchase + consumer credit + other lending (from 2003) | H.8 stocks: CONSUMER + RREACBM027SBOG (no new-lending statistic exists) |
 | Loans to firms | ECB MIR new business to non-financial corporations (from 2003) | H.8 C&I loans BUSLOANS (stock) |
 | Surveys | ECB SPF HICP 1Y/2Y/long term, GDP ~1Y/long term (euro area only) | Philadelphia Fed SPF medians: GDP growth, CPI and unemployment four quarters ahead, 10-year CPI |
@@ -110,6 +110,9 @@ Requests are spaced to respect FRED's rate limit, retried on 429/5xx errors, and
 **Packages need refreshing.** Delete `.venv`; the next launch reinstalls everything. Otherwise packages are reinstalled only when `requirements.txt` changes.
 
 ## Changelog
+
+### v26.4
+- **Country M1, M2 and M3:** the ECB publishes no national monetary aggregates, so they are built from the country's bank deposits held by euro-area money holders (BSI L21, L22 up to 2 years, L23 up to 3 months, L24), one request per country. A published national contribution is still used first when one exists.
 
 ### v26.3
 - **Country new loans to firms:** national MIR data publish no total, only loan-size classes or rate-fixation buckets. The total is now the sum of a complete partition (size classes first), named in the sources sheet; months with a missing component stay empty.

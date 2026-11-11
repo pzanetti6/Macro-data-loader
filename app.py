@@ -13,7 +13,7 @@ import macro_core as mc
 import macro_extra
 import excel_tools
 
-APP_VERSION = "26.3"
+APP_VERSION = "26.4"
 # A hosted app can keep previously imported modules in memory after the repository
 # is updated; reload any helper module whose version does not match this script.
 for _mod in (mc, macro_extra, excel_tools):
@@ -846,8 +846,11 @@ domestic investment (government investment excluded), NIPA net exports or the mo
 rate, and the federal surplus or deficit in % of GDP by fiscal year. FDI is net inflows in % of GDP from the World
 Bank, annual everywhere.
 
-**Money and lending.** Euro-area M1, M2 and M3 are ECB outstanding amounts (seasonally adjusted); for countries
-they are national contributions, which exclude currency in circulation. New loans to households (house purchase,
+**Money and lending.** Euro-area M1, M2 and M3 are ECB outstanding amounts (seasonally adjusted). The ECB
+publishes no national M1, M2 or M3, so for countries they are built from the deposits that euro-area money holders
+keep at the country's banks: M1 = overnight deposits; M2 adds deposits with agreed maturity up to two years and
+deposits redeemable at notice up to three months; M3 adds repurchase agreements. Currency in circulation, money-market
+fund shares and short-term debt securities are not allocated by country and are left out. New loans to households (house purchase,
 consumer credit, other lending) and to firms are ECB new-business volumes, from 2003. The US publishes M1 and M2
 (M3 was discontinued in 2006) and no gross new-lending statistic, so US bank loans are H.8 outstanding stocks:
 consumer plus residential real-estate loans for households, commercial and industrial loans for firms. M1 includes
