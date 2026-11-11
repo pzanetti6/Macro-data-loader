@@ -1,6 +1,6 @@
 # Macro Data Loader
 
-A Streamlit app that downloads, harmonises, checks and exports macroeconomic data from official sources for the euro area, euro-area member states and the United States. The same code runs on Streamlit Community Cloud, Windows and macOS.
+A Streamlit app that downloads, harmonises, checks and exports macroeconomic data from official sources for the euro area, euro-area member states and the United States. Public sources (FRED, ECB, Eurostat, OECD, World Bank, plus the Philadelphia Fed SPF and Yahoo Finance for long market histories) are ranked by reliability and available time length. The same code runs on Streamlit Community Cloud, Windows and macOS.
 
 ## Quick start
 
@@ -33,7 +33,8 @@ The local app runs at http://localhost:8534. Press **Ctrl+C** in the launcher wi
 ```text
 Macro Data Loader/
 ├── app.py               interface
-├── macro_core.py        downloads, harmonisation, temporal disaggregation
+├── macro_core.py        downloads, harmonisation, temporal disaggregation, source ranking
+├── macro_extra.py       national accounts, money, bank lending, surveys and projections
 ├── excel_tools.py       workbook creation and safe updating
 ├── shock_tools.py       shock-upload helpers (not exposed in the public edition)
 ├── requirements.txt
@@ -61,13 +62,29 @@ Do not copy or commit `.venv`: a virtual environment only works on the machine a
 - **Monthly GDP.** GDP is quarterly. Chow-Lin (maximum likelihood, AR(1) errors, industrial production and a trend as indicators) is the default; each quarter's three months average exactly to the published level. Linear interpolation centres each quarter on its middle month. Nothing is extrapolated beyond the last published quarter.
 - **Daily series.** Rates, spreads and equity indices are averaged over the observations in each period. ECB policy rates are carried forward between decisions, up to today and never into the future.
 - **House prices.** Native quarterly: repeated within the quarter for monthly output, averaged for annual output.
+- **Frequencies of the newer series.** National accounts, money, lending and surveys are offered only at their publication frequency or lower; quarterly series are never interpolated to months. Stocks are averaged, flows (new loans) summed, and a quarter or year is reported only when all its months or quarters are published.
+- **Surveys.** Each survey round or projection exercise is dated by the quarter it was released; annual values average the year's rounds.
+- **Source ranking.** Candidates must be up to date (last observation within three months, or one quarter or year, of the freshest); those within 5% of the longest history stay in the race and are ranked by publisher: official statistics and central banks, then international organisations and official mirrors, then market data vendors. Series are never spliced; the `_source` column names the winner.
 
 ## Sources
 
 - **Euro area:** ECB Data Portal and Eurostat (HICP, unemployment, industrial production, GDP, house prices); where both publish an equivalent series the longest and most recent is chosen. OECD harmonised share-price indices for national equity markets. ICE BofA Euro High Yield OAS via FRED.
 - **United States:** BEA (GDPC1), BLS (CPIAUCSL, UNRATE, CPIENGSL), Federal Reserve (INDPRO, FEDFUNDS, GS1, GS10), FRBNY (SOFR), FHFA (USSTHPI, from 1975Q1) and ICE BofA (BAMLH0A0HYM2), all through FRED. Moody's Baa–10Y Treasury spread (BAA10YM, from 1953) via FRED, and the Gilchrist–Zakrajšek credit spread and excess bond premium (from 1973) directly from the Federal Reserve Board.
 - **Credit spread:** one series per economy, chosen automatically (up to date first, then longest). Since April 2026 FRED publishes only the last three years of every ICE BofA series, so in the US the longer Moody's Baa–Treasury or Gilchrist–Zakrajšek spreads are normally used.
-- **Markets:** S&P 500, Dow Jones, Nasdaq Composite and VIX from Yahoo Finance or FRED, whichever is longer and current; MOVE from Yahoo Finance. 
+- **Markets:** S&P 500, Dow Jones, Nasdaq Composite and VIX from Yahoo Finance or FRED, whichever is longer and current; MOVE from Yahoo Finance.
+
+| Series | Euro area and countries | United States |
+|---|---|---|
+| Private consumption | Eurostat `namq_10_gdp` P31_S14_S15, chain-linked volumes (Q) | BEA real PCE: PCEC96 (M, from 2007), PCECC96 (Q, from 1947) |
+| Gross capital formation | Eurostat P5G, chain-linked volumes (Q) | BEA real gross private domestic investment GPDIC1 (Q; government investment excluded) |
+| Trade balance | Eurostat B11, current prices (Q) | BOPGSTB (M, ×12/1000 = bn $ annual rate) or NIPA NETEXP (Q) |
+| Budget balance | Eurostat `gov_10q_ggnfa` B9 % GDP (Q); EDP `gov_10dd_edpt1` competes at annual frequency | Federal surplus/deficit FYFSGDA188S, % GDP, fiscal years (A) |
+| FDI | World Bank BX.KLT.DINV.WD.GD.ZS, net inflows % GDP (A) | same (A) |
+| M1, M2, M3 | ECB BSI outstanding amounts; countries: national contributions (no currency in circulation) | M1SL, M2SL (M3 discontinued in 2006) |
+| Loans to households | ECB MIR new business: house purchase + consumer credit + other lending (from 2003) | H.8 stocks: CONSUMER + RREACBM027SBOG (no new-lending statistic exists) |
+| Loans to firms | ECB MIR new business to non-financial corporations (from 2003) | H.8 C&I loans BUSLOANS (stock) |
+| Surveys | ECB SPF HICP 1Y/2Y/long term, GDP ~1Y/long term (euro area only) | Philadelphia Fed SPF medians: GDP growth, CPI and unemployment four quarters ahead, 10-year CPI |
+| Projections | ECB/Eurosystem staff projections, GDP and HICP this/next year (countries: June and December) | FOMC SEP medians: fed funds this/next year and longer run, GDP, PCE inflation, unemployment this year (ALFRED vintages; FRED API key needed except the longer-run dot) |
 
 ## How FRED is reached
 
@@ -93,6 +110,15 @@ Requests are spaced to respect FRED's rate limit, retried on 429/5xx errors, and
 **Packages need refreshing.** Delete `.venv`; the next launch reinstalls everything. Otherwise packages are reinstalled only when `requirements.txt` changes.
 
 ## Changelog
+
+### v26
+- **National accounts** for the euro area, countries and the US: private consumption, gross capital formation, trade balance, budget balance and FDI.
+- **Surveys:** US SPF and FOMC SEP (Fed dots and macro medians), ECB SPF and ECB/Eurosystem staff projections.
+- **Money and lending:** M1, M2, M3 under Rates & money; "Markets & prices" is now **Financial indicators** and adds bank loans to households and firms.
+- **Frequency-aware choices:** quarterly and annual series are not offered at a higher frequency; the interface says where they are available.
+- **Source ranking now includes reliability** as a tiebreak among candidates of similar length.
+- New series download concurrently with the core series, under the same deadline; one ALFRED or SPF download serves every variable that needs it.
+- The workbook updater recognises the new headers. Deficit-named columns are deliberately not matched, because the series is a balance (surplus positive).
 
 ### v25.3
 - **One credit-spread option per economy.** "Credit spread" compares the available corporate-spread measures and keeps the best: among candidates that are up to date (last observation within three months of the freshest), the longest history wins. US candidates: Moody's Baa minus 10Y Treasury (from 1953), Gilchrist–Zakrajšek credit spread (Federal Reserve Board, from 1973), ICE BofA high-yield OAS. They are never spliced; the source cell names the one used. Euro area: ICE BofA euro high-yield OAS, the only free candidate (three years on FRED since April 2026).

@@ -59,18 +59,31 @@ EA_GEO_CANDIDATES = ["EA21", "EA20", "EA19"]
 CANONICAL_VARS = [
     "real_gdp", "real_gdp_growth", "log_real_gdp", "hicp_rate", "hicp_level",
     "unemployment_rate", "ip", "log_ip", "energy_index", "house_price_index",
+    "consumption", "gcf", "trade_balance", "budget_balance", "fdi",
     "estr", "dfr", "mro", "aaa_1y", "aaa_10y",
-    "sovereign_1y", "sovereign_10y",
+    "sovereign_1y", "sovereign_10y", "m1", "m2", "m3",
     "eurostoxx50", "country_equity_index", "move", "credit_spread",
+    "loans_households", "loans_firms",
+    "ecb_spf_infl_1y", "ecb_spf_infl_2y", "ecb_spf_infl_lt", "ecb_spf_gdp_1y", "ecb_spf_gdp_lt",
+    "ecb_proj_gdp_cy", "ecb_proj_gdp_ny", "ecb_proj_hicp_cy", "ecb_proj_hicp_ny",
 ]
 
 US_VARS = [
     "real_gdp", "real_gdp_growth", "log_real_gdp",
     "cpi_level", "inflation_rate", "unemployment_rate",
     "ip", "log_ip", "energy_cpi", "house_price_index",
-    "fed_funds", "sofr", "treasury_1y", "treasury_10y",
+    "consumption", "gcf", "trade_balance", "budget_balance", "fdi",
+    "fed_funds", "sofr", "treasury_1y", "treasury_10y", "m1", "m2",
     "sp500", "djia", "nasdaq", "vix", "credit_spread",
+    "loans_households", "loans_firms",
+    "spf_gdp", "spf_cpi", "spf_cpi10", "spf_unemp",
+    "fed_dots_cy", "fed_dots_ny", "fed_dots_lr", "sep_gdp_cy", "sep_pce_cy", "sep_unemp_cy",
 ]
+# Variables served by macro_extra (national accounts, money, lending, surveys).
+EXTRA_EU_VARS = CANONICAL_VARS[CANONICAL_VARS.index("consumption"):CANONICAL_VARS.index("estr")] + [
+    "m1", "m2", "m3", "loans_households", "loans_firms"] + CANONICAL_VARS[CANONICAL_VARS.index("ecb_spf_infl_1y"):]
+EXTRA_US_VARS = ["consumption", "gcf", "trade_balance", "budget_balance", "fdi", "m1", "m2",
+                 "loans_households", "loans_firms"] + US_VARS[US_VARS.index("spf_gdp"):]
 
 SOURCE_URLS = {
     "hicp": "https://ec.europa.eu/eurostat/databrowser/view/prc_hicp_midx/default/table",
@@ -377,6 +390,37 @@ class ECBClient:
         s = s[~s.index.duplicated(keep="last")].sort_index()
         _CACHE.set(cache_key, s)
         return s.copy()
+
+    def frame(self, flow: str, key: str) -> pd.DataFrame:
+        """All series matching a (possibly wildcarded) key: columns KEY, TIME_PERIOD, OBS_VALUE.
+
+        ECB SDMX keys accept empty positions as wildcards, e.g. ``A.U2.YER.A..0000``
+        returns every projection exercise in one request.
+        """
+        cache_key = ("ecb-frame", flow, key)
+        cached = _CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+        r = _http_get(f"{ECB_DATA}/{flow}/{key}", params={"format": "csvdata", "detail": "dataonly"},
+                      headers={"Accept": "text/csv"}, timeout=(6, self.timeout), retries=3, label=f"ECB {flow}")
+        if r.status_code == 404:
+            raise DataError(f"ECB {flow}/{key}: no matching series")
+        if r.status_code != 200:
+            raise DataError(f"ECB {flow}/{key} returned HTTP {r.status_code}")
+        try:
+            df = pd.read_csv(io.StringIO(r.text))
+        except Exception:
+            raise DataError(f"ECB {flow}/{key}: response could not be parsed")
+        need = {"TIME_PERIOD", "OBS_VALUE"}
+        if df.empty or not need <= set(df.columns):
+            raise DataError(f"ECB {flow}/{key}: no observations returned")
+        if "KEY" not in df.columns:
+            df["KEY"] = f"{flow}.{key}"
+        df = df[["KEY", "TIME_PERIOD", "OBS_VALUE"]].copy()
+        df["OBS_VALUE"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
+        df = df.dropna(subset=["OBS_VALUE"])
+        _CACHE.set(cache_key, df)
+        return df.copy()
 
 
 def _ecb_area(geo: str, evolving_ea: bool = False) -> str:
@@ -1051,6 +1095,14 @@ def fetch_macro_dataset(
             actual_geo = "EA20"
 
     area = _ecb_area(actual_geo, evolving_ea=requested_ea)
+    # National accounts, money, lending and surveys download in the background
+    # while the core series below are fetched.
+    extra_vars = vars_set & set(EXTRA_EU_VARS)
+    extra_tasks, extra_handle = {}, None
+    if extra_vars:
+        import macro_extra
+        extra_tasks = macro_extra.eu_tasks(actual_geo, requested_ea, extra_vars, freq, start_year, end_year)
+        extra_handle = macro_extra.start_tasks(extra_tasks, workers=3 if requested_ea else 2)
     data: Dict[str, pd.Series] = {}
     sources: Dict[str, str] = {}
     meta: List[FetchMeta] = []
@@ -1284,7 +1336,7 @@ def fetch_macro_dataset(
             cands, errs = [], []
             for sid, label in (("BAMLHE00EHYIOAS", "ICE BofA euro high-yield OAS"),):
                 try:
-                    cands.append({"label": label, "sid": sid, "publisher": "ICE BofA via FRED", "native": "D",
+                    cands.append({"label": label, "sid": sid, "publisher": "ICE BofA via FRED", "tier": 3, "native": "D",
                                   "series": _hy_spread_fred(sid, start_year, end_year, freq, fred_api_key)})
                 except Exception as exc:
                     errs.append(redact(exc))
@@ -1423,6 +1475,13 @@ def fetch_macro_dataset(
         add_meta(_idx_name, "OECD" if not eq.empty else "Unavailable",
                  eq_sid, "M", eq,
                  f"{_idx_name} reference-market label; values use the OECD Financial Market harmonised national share-price series retrieved directly through the OECD SDMX API. Monthly observations are averaged for quarterly/annual output; unavailable country series are left blank.")
+
+    if extra_tasks:
+        import macro_extra
+        d, s, m = macro_extra.collect_tasks(extra_handle, extra_tasks, actual_geo)
+        data.update(d)
+        sources.update(s)
+        meta.extend(m)
 
     target = _period_range(freq, start_year, end_year)
     out = pd.DataFrame(index=target)
@@ -1823,14 +1882,24 @@ def _fetch_country_equity_index(country: str, freq: str, start_year: int, end_ye
 GDP_VARS = {"real_gdp", "real_gdp_growth", "log_real_gdp"}
 
 
-def pick_best_source(candidates: list, freq: str):
-    """Choose among equivalent candidate series: up to date first, then longest.
+TIER_OFFICIAL, TIER_INTERNATIONAL, TIER_MARKET = 1, 2, 3
+TIER_NAMES = {1: "official statistics or central bank", 2: "international organisation or official mirror",
+              3: "market data vendor"}
 
-    ``candidates`` holds dicts with label, sid, publisher and series (already at
-    the output frequency). A candidate counts as up to date when its last
-    observation is within three months (one quarter or one year at lower
-    frequencies) of the freshest candidate; among those, the longest sample
-    wins, ties going to the more recent one. Returns (best or None, summary).
+
+def pick_best_source(candidates: list, freq: str):
+    """Rank candidate series for one concept and return (best or None, summary).
+
+    ``candidates`` holds dicts with label, sid, publisher, series (already at the
+    output frequency) and optionally ``tier`` (1 official statistics or central
+    bank, 2 international organisation or official mirror, 3 market data vendor;
+    default 2). The ranking is:
+
+    1. up to date: last observation within three months (one quarter or one
+       year at lower frequencies) of the freshest candidate;
+    2. sample length: candidates within 5% of the longest span stay in the race,
+       so a meaningfully longer history always wins;
+    3. reliability tier, then the longer span, then the more recent end.
     """
     usable = [c for c in candidates if not c["series"].dropna().empty]
     if not usable:
@@ -1838,10 +1907,15 @@ def pick_best_source(candidates: list, freq: str):
     def bounds(c):
         x = c["series"].dropna()
         return x.index.min(), x.index.max()
+    def span(c):
+        lo, hi = bounds(c)
+        return hi.ordinal - lo.ordinal
     tol = {"M": 3, "Q": 1, "A": 1}[freq]
     freshest = max(bounds(c)[1].ordinal for c in usable)
     current = [c for c in usable if bounds(c)[1].ordinal >= freshest - tol]
-    best = max(current, key=lambda c: (bounds(c)[1].ordinal - bounds(c)[0].ordinal, bounds(c)[1].ordinal))
+    longest = max(span(c) for c in current)
+    near = [c for c in current if span(c) >= longest - int(0.05 * longest)]
+    best = min(near, key=lambda c: (c.get("tier", 2), -span(c), -bounds(c)[1].ordinal))
     summary = "; ".join(f"{c['label']} ({c['sid']}): {bounds(c)[0]} to {bounds(c)[1]}"
                         for c in sorted(usable, key=lambda c: bounds(c)[0].ordinal))
     return best, summary
@@ -1960,10 +2034,17 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
         jobs["FED_EBP"] = fed_gz_ebp
         jobs["BAMLH0A0HYM2"] = lambda: fred_series("BAMLH0A0HYM2", key)
 
+    extra_tasks = {}
+    if vars_set & set(EXTRA_US_VARS):
+        import macro_extra
+        extra_tasks = macro_extra.us_tasks(vars_set & set(EXTRA_US_VARS), freq, key)
+        for var, (_sid, fn) in extra_tasks.items():
+            jobs[f"extra:{var}"] = fn
+
     raw: Dict[str, object] = {}
     failed: Dict[str, str] = {}
     if jobs:
-        pool = ThreadPoolExecutor(max_workers=min(4, len(jobs)), thread_name_prefix="us-fetch")
+        pool = ThreadPoolExecutor(max_workers=min(5, len(jobs)), thread_name_prefix="us-fetch")
         futures = {pool.submit(fn): name for name, fn in jobs.items()}
         pending = set(futures)
         t_end = time.monotonic() + deadline_seconds
@@ -2096,11 +2177,11 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
     if "credit_spread" in vars_set:
         cands = []
         if "BAA10YM" in raw:
-            cands.append({"label": "Moody's Baa minus 10Y Treasury", "sid": "BAA10YM", "publisher": "Moody's via FRED",
+            cands.append({"label": "Moody's Baa minus 10Y Treasury", "sid": "BAA10YM", "publisher": "Moody's via FRED", "tier": 3,
                           "native": "M", "series": _to_frequency(raw["BAA10YM"], freq, "M")})
         if "FED_EBP" in raw:
             cands.append({"label": "Gilchrist-Zakrajsek credit spread", "sid": "gz_spread",
-                          "publisher": "Federal Reserve Board", "native": "M",
+                          "publisher": "Federal Reserve Board", "tier": 1, "native": "M",
                           "series": _to_frequency(raw["FED_EBP"]["gz_spread"], freq, "M")})
         if "BAMLH0A0HYM2" in raw:
             cands.append({"label": "ICE BofA US high-yield OAS", "sid": "BAMLH0A0HYM2", "publisher": "ICE BofA via FRED",
@@ -2125,10 +2206,10 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
             continue
         cands = []
         if f"yahoo:{symbol}" in raw:
-            cands.append({"label": "Yahoo Finance", "sid": symbol, "publisher": "Yahoo Finance", "native": "D",
+            cands.append({"label": "Yahoo Finance", "sid": symbol, "publisher": "Yahoo Finance", "tier": 3, "native": "D",
                           "series": _to_frequency(raw[f"yahoo:{symbol}"], freq, "D")})
         if fred_id in raw:
-            cands.append({"label": "FRED", "sid": fred_id, "publisher": "FRED", "native": "D",
+            cands.append({"label": "FRED", "sid": fred_id, "publisher": "FRED", "tier": 2, "native": "D",
                           "series": _to_frequency(raw[fred_id], freq, "D")})
         best, summary = pick_best_source(cands, freq)
         if best is None:
@@ -2139,6 +2220,15 @@ def fetch_us_dataset(freq: str, start_year: int, end_year: int,
         sources[var] = f"{best['publisher']} · {best['sid']}"
         meta.append(FetchMeta(label, best["publisher"], best["sid"], "US", "D", _latest(best["series"]),
                               f"{note} Compared: {summary}."))
+
+    for var, (sid, _fn) in extra_tasks.items():
+        res = raw.get(f"extra:{var}")
+        if res is None:
+            macro_extra.absorb_failure(var, sid, "US", DataError(failed.get(f"extra:{var}", "not downloaded")),
+                                       data, sources, meta)
+        else:
+            data[var], sources[var], m = res
+            meta.append(m)
 
     target = _period_range(freq, start_year, end_year)
     out = pd.DataFrame(index=target)

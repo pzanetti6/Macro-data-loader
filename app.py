@@ -11,6 +11,7 @@ import macro_core as mc
 from macro_core import (CANONICAL_VARS, COUNTRY_NAMES, EA19, US_VARS, DataError,
                         fetch_country_panel, fetch_macro_dataset, fetch_us_dataset)
 from excel_tools import create_workbook, frequency_of_sheet, update_workbook, workbook_sheet_names
+from macro_extra import AVAILABILITY, available as series_available
 
 try:
     from macro_core import REFERENCE_EQUITY_INDEX
@@ -46,6 +47,15 @@ EU_LABELS = {
     "eurostoxx50": "EURO STOXX 50", "country_equity_index": "National equity index",
     "move": "MOVE (rates volatility)",
     "credit_spread": "Credit spread",
+    "consumption": "Private consumption", "gcf": "Gross capital formation", "trade_balance": "Trade balance",
+    "budget_balance": "Budget balance (% GDP)", "fdi": "FDI inflows (% GDP)",
+    "m1": "M1", "m2": "M2", "m3": "M3",
+    "loans_households": "New loans to households", "loans_firms": "New loans to firms",
+    "ecb_spf_infl_1y": "SPF inflation, 1Y", "ecb_spf_infl_2y": "SPF inflation, 2Y",
+    "ecb_spf_infl_lt": "SPF inflation, long term", "ecb_spf_gdp_1y": "SPF GDP growth, 1Y",
+    "ecb_spf_gdp_lt": "SPF GDP growth, long term",
+    "ecb_proj_gdp_cy": "Projected GDP growth, this year", "ecb_proj_gdp_ny": "Projected GDP growth, next year",
+    "ecb_proj_hicp_cy": "Projected HICP inflation, this year", "ecb_proj_hicp_ny": "Projected HICP inflation, next year",
 }
 US_LABELS = {
     "real_gdp": "Real GDP", "real_gdp_growth": "Real GDP growth", "log_real_gdp": "Log real GDP",
@@ -56,27 +66,48 @@ US_LABELS = {
     "treasury_1y": "Treasury 1Y yield", "treasury_10y": "Treasury 10Y yield",
     "sp500": "S&P 500", "djia": "Dow Jones Industrial Average", "nasdaq": "Nasdaq Composite",
     "vix": "VIX", "credit_spread": "Credit spread",
+    "consumption": "Private consumption", "gcf": "Gross private investment", "trade_balance": "Trade balance",
+    "budget_balance": "Federal budget balance (% GDP)", "fdi": "FDI inflows (% GDP)",
+    "m1": "M1", "m2": "M2",
+    "loans_households": "Bank loans to households", "loans_firms": "Bank loans to firms",
+    "spf_gdp": "SPF GDP growth, 1Y", "spf_cpi": "SPF CPI inflation, 1Y", "spf_cpi10": "SPF CPI inflation, 10Y",
+    "spf_unemp": "SPF unemployment, 1Y",
+    "fed_dots_cy": "Fed dots, this year", "fed_dots_ny": "Fed dots, next year", "fed_dots_lr": "Fed dots, longer run",
+    "sep_gdp_cy": "SEP GDP growth, this year", "sep_pce_cy": "SEP PCE inflation, this year",
+    "sep_unemp_cy": "SEP unemployment, this year",
 }
 GROUPS = {
     "US": {
         "Macro": ["real_gdp", "real_gdp_growth", "log_real_gdp", "cpi_level",
                   "inflation_rate", "unemployment_rate", "ip", "log_ip"],
-        "Rates & money": ["fed_funds", "sofr", "treasury_1y", "treasury_10y", "credit_spread"],
-        "Markets & prices": ["sp500", "djia", "nasdaq", "vix", "house_price_index", "energy_cpi"],
+        "National accounts": ["consumption", "gcf", "trade_balance", "budget_balance", "fdi"],
+        "Rates & money": ["fed_funds", "sofr", "treasury_1y", "treasury_10y", "credit_spread", "m1", "m2"],
+        "Financial indicators": ["sp500", "djia", "nasdaq", "vix", "house_price_index", "energy_cpi",
+                                 "loans_households", "loans_firms"],
+        "Surveys": ["spf_gdp", "spf_cpi", "spf_cpi10", "spf_unemp", "fed_dots_cy", "fed_dots_ny", "fed_dots_lr",
+                    "sep_gdp_cy", "sep_pce_cy", "sep_unemp_cy"],
     },
     "EU": {
         "Macro": ["real_gdp", "real_gdp_growth", "log_real_gdp", "hicp_level",
                   "hicp_rate", "unemployment_rate", "ip", "log_ip"],
+        "National accounts": ["consumption", "gcf", "trade_balance", "budget_balance", "fdi"],
         "Rates & money": ["estr", "dfr", "mro", "aaa_1y", "aaa_10y",
-                          "sovereign_1y", "sovereign_10y", "credit_spread"],
-        "Markets & prices": ["eurostoxx50", "country_equity_index", "move", "house_price_index", "energy_index"],
+                          "sovereign_1y", "sovereign_10y", "credit_spread", "m1", "m2", "m3"],
+        "Financial indicators": ["eurostoxx50", "country_equity_index", "move", "house_price_index", "energy_index",
+                                 "loans_households", "loans_firms"],
+        "Surveys": ["ecb_spf_infl_1y", "ecb_spf_infl_2y", "ecb_spf_infl_lt", "ecb_spf_gdp_1y", "ecb_spf_gdp_lt",
+                    "ecb_proj_gdp_cy", "ecb_proj_gdp_ny", "ecb_proj_hicp_cy", "ecb_proj_hicp_ny"],
     },
 }
 GROUP_HELP = {
     "Macro": "Output, prices, labour market and production.",
-    "Rates & money": "Policy rates, money-market rates, government yields and credit spreads.",
-    "Markets & prices": "Equity and volatility indices, house prices and energy prices.",
+    "National accounts": "Consumption, investment, trade and budget balances, foreign direct investment.",
+    "Rates & money": "Policy and market rates, government yields, credit spreads and monetary aggregates.",
+    "Financial indicators": "Equity and volatility indices, house and energy prices, bank lending.",
+    "Surveys": "Professional forecasters and central-bank projections, one value per round.",
 }
+# Series that need the FRED API key itself (ALFRED vintages), not just FRED access.
+NEEDS_FRED_KEY = {"fed_dots_cy", "fed_dots_ny", "sep_gdp_cy", "sep_pce_cy", "sep_unemp_cy"}
 
 # How each series is built, keyed by the normalised meta label.
 CONSTRUCTION = {
@@ -183,7 +214,8 @@ def meta_rows(meta, freq: str, method: str) -> list:
 
 
 _RATE_LIKE = ("rate", "growth", "inflation", "spread", "yield", "ebp", "dfr", "mro", "estr", "sofr",
-              "fed_funds", "treasury", "aaa", "sovereign", "shock", "gpt", "rr_", "jk_")
+              "fed_funds", "treasury", "aaa", "sovereign", "shock", "gpt", "rr_", "jk_", "balance", "fdi",
+              "spf", "dots", "sep_", "proj_")
 
 
 def _rate_like(name: str) -> bool:
@@ -286,9 +318,14 @@ def segmented(label, options, default, key, **kw):
 
 
 def pills(label, options, key, **kw):
+    """Multi-select pills. A previous choice survives option changes, minus options that left."""
     if "wrap" in _PILL_PARAMS:
         kw["wrap"] = True
-    return st.pills(label, options, selection_mode="multi", default=[], key=key, **kw)
+    if key in st.session_state:
+        st.session_state[key] = [v for v in (st.session_state[key] or []) if v in options]
+    else:
+        kw["default"] = []
+    return st.pills(label, options, selection_mode="multi", key=key, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +373,7 @@ header[data-testid="stHeader"] { background: transparent; }
 .group-name { font-weight: 600; color: var(--ink); margin-top: .3rem; }
 .group-help { color: var(--ink-2); font-size: .84rem; line-height: 1.45; margin-bottom: .6rem; }
 .group-gap { height: .35rem; }
+.group-more { color: var(--ink-2); font-size: .84rem; line-height: 1.45; margin: .15rem 0 0 .1rem; }
 .result-title { font-family: Spectral, Georgia, serif; font-weight: 500; font-size: 1.9rem; color: var(--ink); margin: 3rem 0 .2rem 0; }
 .result-sub { color: var(--ink-2); font-size: .95rem; margin-bottom: 1rem; }
 .footnote { color: var(--ink-2); font-size: .84rem; }
@@ -348,6 +386,8 @@ st.markdown(CSS, unsafe_allow_html=True)
 st.markdown(
     '<div class="hero"><h1>Macro Data Loader</h1>'
     "<p>Official macroeconomic series downloader for US, Euro Area average and single countries.<br>"
+    "Public sources are ranked by reliability and available time length and are pooled across FRED, ECB, "
+    "Eurostat, OECD, World Bank.<br>"
     'Report any bug or suggestion at <a href="mailto:pzanetti@luiss.it">pzanetti@luiss.it</a></p></div>'
     + guilloche_svg(),
     unsafe_allow_html=True,
@@ -400,29 +440,53 @@ if action == "Update a workbook":
 # --- 2 Series ---------------------------------------------------------------
 step(2, "Series", "Pick what to include. Every series gets a neighbouring column naming its source.")
 labels = US_LABELS if is_us else EU_LABELS
+kind = "US" if is_us else ("EA" if geography == "Euro area" else "CTRY")
 if is_us:
-    available = list(US_VARS)
+    offered = list(US_VARS)
 elif geography == "Euro area":
     # sovereign_1y has no harmonised euro-area series and would always be empty.
-    available = [v for v in CANONICAL_VARS if v not in ("country_equity_index", "sovereign_1y")]
+    offered = [v for v in CANONICAL_VARS if v not in ("country_equity_index", "sovereign_1y")]
 else:
-    # No comparable country-level corporate spread exists; the column would be empty.
-    available = [v for v in CANONICAL_VARS if v != "credit_spread"]
+    # No comparable country-level corporate spread or survey exists; the columns would be empty.
+    offered = [v for v in CANONICAL_VARS if v != "credit_spread"]
+offered = [v for v in offered if v not in AVAILABILITY or kind in AVAILABILITY[v]]
+# Quarterly or annual series are not offered at a higher frequency.
+available = [v for v in offered if series_available(v, kind, freq)]
+
+
+def hidden_note(hidden: list, any_offered: bool) -> str:
+    """Say where the series missing at this frequency can be found."""
+    if not any_offered:
+        lowest = "annually" if all(AVAILABILITY[v][kind] == "A" for v in hidden) else "quarterly or annually"
+        target = "Annual" if lowest == "annually" else "Quarterly or Annual"
+        return f"Published {lowest}: switch to {target} to choose from {len(hidden)} series."
+    name = lambda v: labels.get(v, v).replace("% GDP", "%\u00a0GDP")
+    quarterly = [name(v) for v in hidden if "Q" in AVAILABILITY[v][kind]]
+    annual = [name(v) for v in hidden if AVAILABILITY[v][kind] == "A"]
+    parts = ([f"Also offered quarterly: {', '.join(quarterly)}."] if quarterly else []) + \
+            ([f"Annual only: {', '.join(annual)}."] if annual else [])
+    return " ".join(parts)
+
 
 selected: list = []
 for group, members in GROUPS["US" if is_us else "EU"].items():
     options = [v for v in members if v in available]
-    if not options:
+    hidden = [v for v in members if v in offered and v not in available]
+    if not options and not hidden:
         continue
     g1, g2 = st.columns([1, 3.1], gap="large")
     with g1:
         st.markdown(f'<div class="group-name">{group}</div><div class="group-help">{GROUP_HELP[group]}</div>',
                     unsafe_allow_html=True)
     with g2:
-        picked = pills(group, options, key=f"vars_{geography}_{group}",
-                       format_func=lambda v: labels.get(v, v.replace("_", " ").title()),
-                       label_visibility="collapsed")
-        selected.extend(picked or [])
+        if options:
+            picked = pills(group, options, key=f"vars_{geography}_{group}",
+                           format_func=lambda v: labels.get(v, v.replace("_", " ").title()),
+                           label_visibility="collapsed")
+            selected.extend(picked or [])
+        if hidden:
+            st.markdown(f'<div class="group-more">{hidden_note(hidden, bool(options))}</div>',
+                        unsafe_allow_html=True)
     st.markdown('<div class="group-gap"></div>', unsafe_allow_html=True)
 
 st.caption(f"{len(selected)} of {len(available)} series selected." if selected else "Nothing selected yet.")
@@ -450,8 +514,9 @@ if needs_gdp_method:
                  "each quarter across its months; the three months always average to the published quarter.")
 
 fred_key = secret_fred_key()
+needs_key = bool(NEEDS_FRED_KEY & set(selected))
 if needs_fred:
-    with st.expander("FRED connection", expanded=False, icon=":material/key:"):
+    with st.expander("FRED connection", expanded=needs_key and not fred_key, icon=":material/key:"):
         st.markdown(
             "US series and high-yield spreads come from FRED. Without a key the app uses FRED's public CSV "
             "download; with a free [FRED API key](https://fredaccount.stlouisfed.org/apikeys) it uses the "
@@ -466,6 +531,10 @@ if needs_fred:
             st.error(problem)
         elif typed:
             fred_key = typed.strip()
+        if needs_key and not fred_key:
+            st.info("Fed dots and SEP medians are rebuilt from FRED's archive of past releases (ALFRED), "
+                    "which only answers with an API key. Without one those columns stay empty; the longer-run "
+                    "dot works either way.", icon=":material/info:")
         with k2:
             if st.button("Check connection", width="stretch"):
                 with st.spinner("Contacting FRED"):
@@ -706,14 +775,46 @@ interpolation centres each quarter on its middle month. No months are filled bey
 **Daily series.** Policy rates, money-market rates, yields, spreads and equity indices are averaged over the
 observations in each period. ECB policy rates are carried forward between decisions, up to today.
 
+**Source ranking.** When several public sources publish the same concept, the app keeps those that are up to date
+(last observation within three months, or one quarter or year, of the freshest), then those within 5% of the longest
+history, and among them prefers official statistics and central banks, then international organisations and
+official mirrors, then market data vendors. The winner is named in the source column; series are never spliced.
+
+**Frequencies.** A series is offered only at its publication frequency or lower: quarterly national accounts and
+quarterly surveys are not interpolated to months. Stocks and levels are averaged over the period, flows (new loans)
+are summed, and for the national-accounts, money and lending series a quarter or year is reported only once all of
+its months or quarters are published.
+
 **Euro area.** ECB Data Portal and Eurostat; where both publish an equivalent series the one with the longest and
 most recent history is used. National equity indices are OECD harmonised share-price indices, labelled with the
-familiar market name (DAX, CAC 40, FTSE MIB). No harmonised euro-area 1-year sovereign yield or country-level
-high-yield spread exists, so those are not offered.
+familiar market name (DAX, CAC 40, FTSE MIB). No harmonised euro-area 1-year sovereign yield, country-level
+high-yield spread or country SPF exists, so those are not offered.
 
 **United States.** BEA real GDP (GDPC1), BLS CPI-U (CPIAUCSL) and unemployment (UNRATE), Federal Reserve
 industrial production (INDPRO), federal funds (FEDFUNDS) and Treasury yields (GS1, GS10), FRBNY SOFR, FHFA house
 prices (USSTHPI, from 1975), all through FRED.
+
+**National accounts.** Euro area and countries: Eurostat quarterly national accounts (household and NPISH
+consumption and gross capital formation in chain-linked volumes, external balance of goods and services at current
+prices) and government net lending in % of GDP (quarterly government finance statistics; at annual frequency the
+EDP notification competes). United States: BEA real PCE (monthly from 2007, quarterly from 1947), real gross private
+domestic investment (government investment excluded), NIPA net exports or the monthly BOP trade balance at an annual
+rate, and the federal surplus or deficit in % of GDP by fiscal year. FDI is net inflows in % of GDP from the World
+Bank, annual everywhere.
+
+**Money and lending.** Euro-area M1, M2 and M3 are ECB outstanding amounts (seasonally adjusted); for countries
+they are national contributions, which exclude currency in circulation. New loans to households (house purchase,
+consumer credit, other lending) and to firms are ECB new-business volumes, from 2003. The US publishes M1 and M2
+(M3 was discontinued in 2006) and no gross new-lending statistic, so US bank loans are H.8 outstanding stocks:
+consumer plus residential real-estate loans for households, commercial and industrial loans for firms. M1 includes
+savings deposits from May 2020.
+
+**Surveys.** Each survey round is dated by the quarter it was released; annual values average the rounds. US SPF
+(Philadelphia Fed) medians: GDP growth, CPI inflation and unemployment four quarters ahead, and ten-year CPI
+inflation. Fed dots and SEP: FOMC median projections for the end of this year and next year and the longer run,
+rebuilt from FRED/ALFRED vintages (an API key is required except for the longer-run dot). ECB SPF: average point
+forecasts at one-year, two-year and longer-term horizons. ECB/Eurosystem staff projections: annual growth and HICP
+inflation for this year and next year; country values come from the June and December Eurosystem exercises.
 
 **Credit spread.** One series per economy, chosen automatically: among the candidates that are up to date (last
 observation within three months of the freshest), the one with the longest history is used and named in its source

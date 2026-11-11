@@ -39,6 +39,27 @@ ALIASES = {
     "vix": ["vix", "vixcls"],
     "move": ["move", "move_index"],
     "djia": ["djia", "dow_jones", "dow_jones_industrial_average"],
+    # National accounts. Deficit-named headers are deliberately not matched: the
+    # series is a balance (surplus positive), so writing it under "deficit" would flip signs.
+    "consumption": ["consumption", "private_consumption", "real_consumption", "household_consumption", "pce_real"],
+    "gcf": ["gcf", "gross_capital_formation", "investment", "real_investment", "gpdi"],
+    "trade_balance": ["trade_balance", "net_exports", "external_balance"],
+    "budget_balance": ["budget_balance", "fiscal_balance", "government_balance", "gov_balance", "net_lending"],
+    "fdi": ["fdi", "fdi_inflows", "fdi_gdp", "fdi_net_inflows"],
+    # Money and lending
+    "m1": ["m1", "money_m1", "m1_stock"],
+    "m2": ["m2", "money_m2", "m2_stock"],
+    "m3": ["m3", "money_m3", "m3_stock"],
+    "loans_households": ["loans_households", "household_loans", "hh_loans", "loans_hh", "new_loans_households"],
+    "loans_firms": ["loans_firms", "firm_loans", "nfc_loans", "loans_nfc", "business_loans", "new_loans_firms"],
+    # Surveys and projections (exact names only)
+    "spf_gdp": ["spf_gdp"], "spf_cpi": ["spf_cpi"], "spf_cpi10": ["spf_cpi10"], "spf_unemp": ["spf_unemp"],
+    "fed_dots_cy": ["fed_dots_cy"], "fed_dots_ny": ["fed_dots_ny"], "fed_dots_lr": ["fed_dots_lr"],
+    "sep_gdp_cy": ["sep_gdp_cy"], "sep_pce_cy": ["sep_pce_cy"], "sep_unemp_cy": ["sep_unemp_cy"],
+    "ecb_spf_infl_1y": ["ecb_spf_infl_1y"], "ecb_spf_infl_2y": ["ecb_spf_infl_2y"],
+    "ecb_spf_infl_lt": ["ecb_spf_infl_lt"], "ecb_spf_gdp_1y": ["ecb_spf_gdp_1y"], "ecb_spf_gdp_lt": ["ecb_spf_gdp_lt"],
+    "ecb_proj_gdp_cy": ["ecb_proj_gdp_cy"], "ecb_proj_gdp_ny": ["ecb_proj_gdp_ny"],
+    "ecb_proj_hicp_cy": ["ecb_proj_hicp_cy"], "ecb_proj_hicp_ny": ["ecb_proj_hicp_ny"],
 }
 
 # Columns the updater must never overwrite: shocks, forecasts and policy/market
@@ -50,7 +71,7 @@ PROTECTED_PREFIXES = ("qe_", "fg_", "gpt_", "rr_", "jk_", "de_rate")
 
 LEVEL_SHIFT_THRESHOLD = 0.02   # 2% median gap between old and new values
 RATE_LIKE = ("rate", "growth", "inflation", "spread", "yield", "ebp", "dfr", "mro", "estr", "sofr",
-             "fed_funds", "treasury", "aaa", "sovereign")
+             "fed_funds", "treasury", "aaa", "sovereign", "balance", "fdi", "spf", "dots", "sep_", "proj_")
 
 
 def normalize(x) -> str:
@@ -375,13 +396,15 @@ def _style_sheet(ws, number_format: Optional[str] = None):
 
 _NOTES = {
     "EA": [
-        ("Data sources", "ECB Data Portal and Eurostat. Where both publish an equivalent series, the one with the "
-                         "longest and most recent history is used; each *_source column names the series chosen."),
+        ("Data sources", "ECB Data Portal, Eurostat, OECD and World Bank. Where several publish an equivalent series, "
+                         "up-to-date sources are ranked by history length, then reliability; each *_source column "
+                         "names the series chosen."),
         ("Inflation", "Published HICP annual rate of change (y/y %). Quarterly and annual values average the monthly rates."),
     ],
     "US": [
-        ("Data sources", "BEA, BLS, Federal Reserve, FRBNY and FHFA series distributed through FRED; ICE BofA spreads "
-                         "via FRED; equity indices from Yahoo Finance (FRED fallback covers ten years only)."),
+        ("Data sources", "BEA, BLS, Federal Reserve, FRBNY, FHFA, OMB and FOMC series distributed through FRED/ALFRED; "
+                         "Philadelphia Fed SPF; World Bank FDI; equity indices from Yahoo Finance or FRED, whichever "
+                         "is longer and up to date."),
         ("Inflation", "12-month % change of CPI-U (CPIAUCSL). Quarterly and annual values average the monthly rates."),
     ],
 }
@@ -392,6 +415,10 @@ _COMMON_NOTES = [
     ("Daily series", "Rates, spreads and equity indices are averaged over the observations in each period. "
                      "The latest period may still be in progress."),
     ("Dates", "Monthly YYYY-MM, quarterly YYYYqN, annual YYYY (Stata-friendly text)."),
+    ("Surveys", "Each survey round or projection exercise is dated by the quarter it was released; annual values "
+                "average the year's rounds."),
+    ("Flows and stocks", "New loans are flows summed over the period; money and loan stocks are averaged. National "
+                         "accounts, money and lending are reported only for complete quarters and years."),
 ]
 
 
