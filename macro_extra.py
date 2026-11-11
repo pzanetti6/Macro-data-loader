@@ -475,24 +475,64 @@ def ecb_spf(ecb, topic: str, horizon: str) -> Tuple[pd.Series, str]:
     return s, key
 
 
-def ecb_projection(ecb, area: str, item: str, horizon: int) -> Tuple[pd.Series, str]:
-    """Staff projection for (release year + horizon), one point per exercise quarter."""
+def information_set(exercises: Dict[pd.Period, Dict[int, float]], horizon: int, max_carry: int = 3) -> pd.Series:
+    """Quarterly series of the latest projection available in each quarter.
+
+    ``exercises`` maps the release quarter of each projection round to its
+    {target year: value}. Quarter q shows the most recent round released in or
+    before q, for target year q.year + horizon. A round is carried forward for
+    at most ``max_carry`` quarters and never beyond the current quarter, so
+    country projections (June and December only) leave no gaps and a December
+    round correctly supplies "this year" for the following first quarter.
+    """
+    if not exercises:
+        return pd.Series(dtype=float)
+    rounds = sorted(exercises)
+    now = pd.Period(pd.Timestamp.today(), freq="Q")
+    last = min(rounds[-1] + max_carry, now)
+    out = {}
+    i = 0
+    for q in pd.period_range(rounds[0], max(last, rounds[-1]), freq="Q"):
+        while i + 1 < len(rounds) and rounds[i + 1] <= q:
+            i += 1
+        if q.ordinal - rounds[i].ordinal > max_carry:
+            continue
+        v = exercises[rounds[i]].get(q.year + horizon)
+        if v is not None and np.isfinite(v):
+            out[q] = float(v)
+    return pd.Series(out, dtype=float).sort_index()
+
+
+def ecb_exercises(ecb, area: str, item: str) -> Tuple[Dict[pd.Period, Dict[int, float]], str]:
+    """Every ECB/Eurosystem projection round: release quarter -> {target year: value}."""
     with _single_flight(("ecb-mpd", area, item)):     # this year and next year share this request
         df = ecb.frame("MPD", f"A.{area}.{item}.A..0000")
-    out = {}
+    out: Dict[pd.Period, Dict[int, float]] = {}
     for key, sub in df.groupby("KEY"):
         m = re.search(r"\.([WGSA])(\d{2})\.0000$", key)
         if not m:
             continue
         yy = int(m.group(2))
         year = 1900 + yy if yy >= 90 else 2000 + yy
-        target = str(year + horizon)
-        hit = sub[sub["TIME_PERIOD"].astype(str).str[:4] == target]
-        if not hit.empty:
-            out[pd.Period(f"{year}Q{_SEASON_Q[m.group(1)]}", freq="Q")] = float(hit["OBS_VALUE"].iloc[-1])
+        q = pd.Period(f"{year}Q{_SEASON_Q[m.group(1)]}", freq="Q")
+        out[q] = {int(str(tp)[:4]): float(v) for tp, v in zip(sub["TIME_PERIOD"], sub["OBS_VALUE"])}
     if not out:
         raise DataError(f"ECB projections {item} for {area}: no exercises found")
-    return pd.Series(out, dtype=float).sort_index(), f"MPD.A.{area}.{item}.A.<exercise>.0000"
+    return out, f"MPD.A.{area}.{item}.A.<exercise>.0000"
+
+
+def ecb_projection(ecb, area: str, item: str, horizon: int) -> Tuple[pd.Series, str]:
+    ex, sid = ecb_exercises(ecb, area, item)
+    return information_set(ex, horizon), sid
+
+
+def sep_exercises(vint: pd.DataFrame) -> Dict[pd.Period, Dict[int, float]]:
+    """ALFRED vintages of an SEP median: release quarter -> {target year: value}."""
+    out: Dict[pd.Period, Dict[int, float]] = {}
+    for v in sorted(vint["realtime_start"].unique()):
+        live = vint[(vint["realtime_start"] <= v) & (vint["realtime_end"] >= v)]
+        out[pd.Period(pd.Timestamp(v), freq="Q")] = {int(d.year): float(x) for d, x in zip(live["date"], live["value"])}
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -628,11 +668,12 @@ def us_tasks(vars_set, freq: str, key: Optional[str], start_year: Optional[int] 
            "sep_unemp_cy": ("UNRATEMD", 0, "Median FOMC projection of the Q4 unemployment rate, current year")}
     for var, (sid, h, text) in sep.items():
         def build(sid=sid, h=h, text=text):
-            s = projection_by_release(fred_vintages(sid, key), h)
-            return _cand("FOMC SEP", f"{sid} (ALFRED vintages)", "FOMC via ALFRED", _releases_to_freq(s, freq), "Q",
-                         TIER_OFFICIAL, f"{text}, percent. One value per SEP release (four a year): quarterly = "
-                         "the release in that quarter, annual = average of the year's releases. Rebuilt from "
-                         "ALFRED vintages, so it starts with the first SEP FRED stored.")
+            s = information_set(sep_exercises(fred_vintages(sid, key)), h)
+            return _cand("FOMC SEP", f"{sid} (ALFRED vintages)", "FOMC via ALFRED",
+                         convert(s, freq, "mean", complete=False), "Q", TIER_OFFICIAL,
+                         f"{text}, percent. Each quarter shows the latest SEP released by then (four a year), for "
+                         "the target year counted from that quarter; annual = average of the four quarters. Rebuilt "
+                         "from ALFRED vintages, so it starts with the first SEP FRED stored.")
         add(var, [(sid, build)])
 
     def lr():
@@ -779,8 +820,22 @@ def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int,
         return _cand("World Bank", f"GC.NLD.TOTL.GD.ZS ({iso3})", "World Bank", s, "A", TIER_INTERNATIONAL,
                      "Net lending (+) / net borrowing (-), percent of GDP (World Bank WDI, IMF government finance "
                      "statistics; central government for some countries). Annual only.")
-    add("budget_balance", [("Eurostat gov_10q_ggnfa B9", gov_q), ("Eurostat gov_10dd_edpt1 B9", gov_a),
-                           ("World Bank GC.NLD.TOTL.GD.ZS", gov_wb)])
+    def gov_ecb():
+        # ECB government finance statistics: quarterly ratio to GDP, or the four-quarter moving sum
+        # ratio (CY) when the quarterly ratio is not published.
+        df = ec().frame("GFS", f"Q.N.{area}.W0.S13.S1._Z.B.B9._Z._Z._Z.XDC_R_B1GQ+XDC_R_B1GQ_CY._Z.S.V.N+CY._T")
+        counts = df.groupby("KEY")["TIME_PERIOD"].count()
+        key_ = sorted(counts.index, key=lambda k: ("_CY." in k, -counts[k]))[0]
+        sub = df[df["KEY"] == key_]
+        s = _series(sub["OBS_VALUE"], sub["TIME_PERIOD"], "Q")
+        rolling = "_CY." in key_
+        return _cand("ECB GFS", key_, "ECB", convert(s, freq), "Q", TIER_OFFICIAL,
+                     "General government net lending (+) / net borrowing (-), percent of GDP, ECB government "
+                     "finance statistics, not seasonally adjusted" +
+                     ("; four-quarter moving sum, so each quarter shows the deficit of the past year" if rolling
+                      else "") + ". Annual = average of quarters.")
+    add("budget_balance", [("Eurostat gov_10q_ggnfa B9", gov_q), ("ECB GFS B9", gov_ecb),
+                           ("Eurostat gov_10dd_edpt1 B9", gov_a), ("World Bank GC.NLD.TOTL.GD.ZS", gov_wb)])
 
 
     def wb_fdi():
@@ -800,8 +855,12 @@ def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int,
                 note = (f"Euro-area {var.upper()}, outstanding amounts at month end, million euro, seasonally and "
                         "working-day adjusted; period average.")
             else:
-                df = ec().frame("BSI", f"M.{area}..V.{item}.X.1.U2.2300.Z01.E")
-                keys = sorted(df["KEY"].unique(), key=lambda k: (f".{area}.Y." not in k, k))   # adjusted first
+                # National contributions are published under MFIs (U) or MFIs plus central government (V),
+                # for the aggregate or its variant excluding currency in circulation (e.g. M30A).
+                df = ec().frame("BSI", f"M.{area}..U+V.{item}+{item}A.X.1..2300.Z01.E")
+                counts = df.groupby("KEY")["TIME_PERIOD"].count()
+                keys = sorted(counts.index, key=lambda k: (f".{area}.Y." not in k, f".{item}." not in k,
+                                                           ".V." not in k, -counts[k]))
                 sid = keys[0]
                 sub = df[df["KEY"] == sid]
                 s = _series(sub["OBS_VALUE"], sub["TIME_PERIOD"], "M")
@@ -862,8 +921,10 @@ def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int,
             scope = ("ECB and Eurosystem staff exercises, four a year (March, June, September, December)"
                      if kind == "EA" else "Eurosystem June and December exercises (national breakdown)")
             return _cand("ECB/Eurosystem staff projections", sid, "ECB", convert(s, freq, "mean", complete=False),
-                         "Q", TIER_OFFICIAL, f"Staff projection of {text}, annual percent change; one value per "
-                         f"exercise in its release quarter; {scope}. Annual = average of the year's exercises.")
+                         "Q", TIER_OFFICIAL, f"Staff projection of {text}, annual percent change. Each quarter "
+                         f"shows the latest exercise published by then ({scope}), for the target year counted "
+                         "from that quarter, so a December exercise supplies the next first quarter's 'this "
+                         "year'. Annual = average of the four quarters.")
         add(var, [("MPD", build)])
     return tasks
 

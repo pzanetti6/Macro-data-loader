@@ -285,9 +285,9 @@ def chart_frame(df: pd.DataFrame, cols: list, freq: str, scale: str):
     skipped = []
     if scale == "Index, first common period = 100" and cols:
         common = x.dropna()
-        if common.empty:
-            return x.iloc[0:0], cols
-        base = common.iloc[0]
+        # without a period shared by all series, each one is indexed to its own first observation
+        base = common.iloc[0] if not common.empty else x.apply(lambda c: c.dropna().iloc[0] if c.notna().any()
+                                                               else np.nan)
         keep = [c for c in cols if base[c] > 0]
         skipped = [c for c in cols if c not in keep]
         x = x[keep].div(base[keep]).mul(100.0)
@@ -746,7 +746,12 @@ if res:
             if frame.dropna(how="all").empty:
                 st.caption("These series have no overlapping observations to plot.")
                 return
-            st.line_chart(frame, height=380, width="stretch")
+            # long format without missing values: every series is drawn as one continuous line,
+            # even when it has gaps or is published less often than the sheet's frequency
+            long = (frame.rename_axis("period").reset_index()
+                    .melt("period", var_name="series", value_name="value").dropna(subset=["value"]))
+            st.line_chart(long, x="period", y="value", color="series", height=380, width="stretch",
+                          x_label="", y_label="")
             span = frame.dropna(how="all").index
             st.caption(f"{span.min():%b %Y} to {span.max():%b %Y}. "
                        + ("Series in different units share one axis here; switch the scale to compare their shape. "

@@ -111,6 +111,12 @@ Requests are spaced to respect FRED's rate limit, retried on 429/5xx errors, and
 
 ## Changelog
 
+### v26.2
+- **Eurostat requests use the client's own session again**, now with three attempts that also cover answers that are not JSON (gateway or maintenance pages sent with HTTP 200). This caused the "Expecting value: line 1 column 1" errors on industrial production and the budget balance.
+- **ECB fallbacks fixed:** industrial production comes from the ECB's new STBS dataset (`STBS.M.<country>.Y.PROD.NS0020.4D0.N.IX`; STS stopped updating); country M1–M3 use the national-contribution codes (sector U or V, items such as `M30A`, M3 excluding currency in circulation); the quarterly budget balance can also come from ECB government finance statistics (GFS). Error cells now list every key tried, not only the last.
+- **Projections and the Fed's SEP form an information set:** each quarter shows the latest round published by then, for the target year counted from that quarter. Country projections (June and December only) no longer leave every other quarter empty.
+- **Charts draw each series as a continuous line** across gaps; "Index = 100" falls back to each series' first observation when the series share no common period.
+
 ### v26.1
 - **Country national accounts from four publishers.** Consumption, gross capital formation and the trade balance now compare Eurostat, ECB main national accounts and OECD quarterly national accounts (World Bank too at annual frequency, with histories back to the 1960s). A country is no longer left empty when one portal fails. Candidates are compared on the requested window only.
 - **Eurostat requests retry** on throttling and server errors; a single throttled answer in a large country panel used to empty a column.

@@ -303,12 +303,31 @@ class EurostatClient:
         if cached is not None:
             return cached.copy()
         url = f"{EUROSTAT_STATS}/{dataset}"
-        # Retries on 429/5xx: country panels send many Eurostat requests at once and a
-        # single throttled answer used to leave a whole column empty.
-        r = _http_get(url, params=params, timeout=(5, self.timeout), retries=2, label=f"Eurostat {dataset}")
-        if r.status_code != 200:
-            raise DataError(f"Eurostat {dataset} returned HTTP {r.status_code}: {r.text[:240]}")
-        js = r.json()
+        # Country panels send many Eurostat requests at once. Throttled (429/5xx) or
+        # non-JSON answers (maintenance or gateway pages served with HTTP 200) are retried.
+        js, last = None, "no response"
+        for attempt in range(3):
+            try:
+                r = self.session.get(url, params=params, timeout=(5, self.timeout),
+                                     headers={"Accept": "application/json"})
+            except requests.RequestException as exc:
+                last = f"network error ({type(exc).__name__})"
+            else:
+                if r.status_code == 200:
+                    try:
+                        js = r.json()
+                        break
+                    except ValueError:
+                        ctype = r.headers.get("Content-Type", "unknown type")
+                        last = f"answer was not JSON ({ctype}, {len(r.content)} bytes)"
+                elif r.status_code in _TRANSIENT:
+                    last = f"HTTP {r.status_code}"
+                else:
+                    raise DataError(f"Eurostat {dataset} returned HTTP {r.status_code}: {r.text[:240]}")
+            if attempt < 2:
+                time.sleep(1.5 * (2 ** attempt))
+        if js is None:
+            raise DataError(f"Eurostat {dataset}: {last} after 3 attempts")
         if js.get("error"):
             raise DataError(f"Eurostat {dataset}: {js['error']}")
         out = _decode_jsonstat(js)
@@ -461,26 +480,28 @@ def _try_ecb_monthly(flow: str, keys: Sequence[str], start_m: str, end_m: str,
                      client: ECBClient) -> Tuple[pd.Series, str]:
     errs = []
     for key in keys:
+        fl, k = key.split("/", 1) if "/" in key else (flow, key)
         try:
-            s = _series_to_monthly(client.series(flow, key, start_m, end_m))
+            s = _series_to_monthly(client.series(fl, k, start_m, end_m))
             if not s.empty:
-                return s, f"{flow}.{key}"
+                return s, f"{fl}.{k}"
         except Exception as exc:
-            errs.append(str(exc))
-    raise DataError(errs[-1] if errs else f"No ECB {flow} candidate returned observations.")
+            errs.append(f"{fl}.{k}: {str(exc).split(':', 1)[-1].strip()[:80]}")
+    raise DataError("; ".join(errs) if errs else f"No ECB {flow} candidate returned observations.")
 
 
 def _try_ecb_quarterly(flow: str, keys: Sequence[str], start_q: str, end_q: str,
                        client: ECBClient) -> Tuple[pd.Series, str]:
     errs = []
     for key in keys:
+        fl, k = key.split("/", 1) if "/" in key else (flow, key)
         try:
-            s = _series_to_quarterly(client.series(flow, key, start_q, end_q))
+            s = _series_to_quarterly(client.series(fl, k, start_q, end_q))
             if not s.empty:
-                return s, f"{flow}.{key}"
+                return s, f"{fl}.{k}"
         except Exception as exc:
-            errs.append(str(exc))
-    raise DataError(errs[-1] if errs else f"No ECB {flow} candidate returned observations.")
+            errs.append(f"{fl}.{k}: {str(exc).split(':', 1)[-1].strip()[:80]}")
+    raise DataError("; ".join(errs) if errs else f"No ECB {flow} candidate returned observations.")
 
 
 def _dual_monthly(name: str, eurostat_getter, ecb_flow: str, ecb_keys: Sequence[str],
@@ -1273,16 +1294,18 @@ def fetch_macro_dataset(
             and bool({"real_gdp", "real_gdp_growth", "log_real_gdp"} & vars_set)
         )
         if need_ip_output or need_ip_for_chowlin:
-            ecb_ip_keys = [
-                f"M.{area}.Y.PROD.NS0020.4.000",
-                f"M.{area}.Y.PROD.B-D.4.000",
-            ]
+            # The ECB moved short-term business statistics from STS to STBS (2025-26);
+            # NS0020 = total industry excluding construction. Fixed-composition euro-area
+            # codes (I10/I9) are tried after the evolving U2 code.
+            ip_areas = [area] + (["I10", "I9"] if requested_ea else [])
+            ecb_ip_keys = ([f"STBS/M.{a}.Y.PROD.NS0020.4D0.N.IX" for a in ip_areas]
+                           + [f"STS/M.{a}.Y.PROD.NS0020.4.000" for a in ip_areas])
             src, ip, sid = _dual_monthly(
                 "sts_inpr_m", lambda: _fetch_ip(client, actual_geo, start_m, end_m),
                 "STS", ecb_ip_keys, start_m, end_m, ecb
             )
             ip_monthly_indicator = ip
-            ip_indicator_source = src
+            ip_indicator_source = f"{src} · {sid}" if sid and sid != src else src
             ip_f = _aggregate_monthly(ip, freq, "mean")
             if "ip" in vars_set:
                 data["ip"] = ip_f
