@@ -15,6 +15,8 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 
+VERSION = "26.3"
+
 EUROSTAT_STATS = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
 ECB_DATA = "https://data-api.ecb.europa.eu/service/data"
 

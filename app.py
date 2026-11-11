@@ -7,7 +7,21 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import importlib
+
 import macro_core as mc
+import macro_extra
+import excel_tools
+
+APP_VERSION = "26.3"
+# A hosted app can keep previously imported modules in memory after the repository
+# is updated; reload any helper module whose version does not match this script.
+for _mod in (mc, macro_extra, excel_tools):
+    if getattr(_mod, "VERSION", None) != APP_VERSION:
+        importlib.reload(_mod)
+if getattr(macro_extra, "VERSION", None) != APP_VERSION:   # macro_extra binds macro_core at import
+    importlib.reload(macro_extra)
+
 from macro_core import (CANONICAL_VARS, COUNTRY_NAMES, EA19, US_VARS, DataError,
                         fetch_country_panel, fetch_macro_dataset, fetch_us_dataset)
 from excel_tools import create_workbook, frequency_of_sheet, update_workbook, workbook_sheet_names
@@ -860,3 +874,4 @@ rates-volatility gauge.
     if st.button("Clear downloaded data", help="Forget the downloads kept for six hours and fetch fresh copies next time."):
         mc.clear_download_cache()
         st.toast("Download cache cleared.")
+    st.caption(f"Version {APP_VERSION}")

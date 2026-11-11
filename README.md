@@ -111,6 +111,10 @@ Requests are spaced to respect FRED's rate limit, retried on 429/5xx errors, and
 
 ## Changelog
 
+### v26.3
+- **Country new loans to firms:** national MIR data publish no total, only loan-size classes or rate-fixation buckets. The total is now the sum of a complete partition (size classes first), named in the sources sheet; months with a missing component stay empty.
+- **No more stale code after an update:** every module carries a version; `app.py` reloads any helper module whose version differs, which a hosted app can otherwise keep in memory after the repository changes. The version is shown at the bottom of the page.
+
 ### v26.2
 - **Eurostat requests use the client's own session again**, now with three attempts that also cover answers that are not JSON (gateway or maintenance pages sent with HTTP 200). This caused the "Expecting value: line 1 column 1" errors on industrial production and the budget balance.
 - **ECB fallbacks fixed:** industrial production comes from the ECB's new STBS dataset (`STBS.M.<country>.Y.PROD.NS0020.4D0.N.IX`; STS stopped updating); country M1–M3 use the national-contribution codes (sector U or V, items such as `M30A`, M3 excluding currency in circulation); the quarterly budget balance can also come from ECB government finance statistics (GFS). Error cells now list every key tried, not only the last.

@@ -19,6 +19,8 @@ import numpy as np
 import pandas as pd
 
 import macro_core as mc
+
+VERSION = "26.3"
 from macro_core import DataError, FetchMeta, redact
 
 # ---------------------------------------------------------------------------
@@ -711,6 +713,46 @@ def _ecb_monthly(ecb, flow: str, key: str) -> pd.Series:
     return _series(s.to_numpy(), s.index, "M")
 
 
+# Partitions of new loans to firms that add up to the total (MIR codes). Amount categories:
+# 0 = up to EUR 1 million, 1 = over EUR 1 million, 2 = up to EUR 0.25 million, 3 = EUR 0.25-1 million.
+# Initial rate fixation: D up to 3 months, Q 3 months-1 year, F floating and up to 1 year, R 1-3 years,
+# S 3-5 years, O 5-10 years, P over 10 years, J over 5 years, I over 1 year.
+_AMOUNT_PARTS = [("0", "1"), ("2", "3", "1")]
+_FIXATION_PARTS = [("F", "I"), ("F", "R", "S", "J"), ("D", "Q", "R", "S", "J"), ("F", "R", "S", "O", "P"),
+                   ("D", "Q", "R", "S", "O", "P")]
+
+
+def mir_firms_total(ecb, area: str) -> Tuple[pd.Series, str]:
+    """Total new loans to firms for one country.
+
+    National MIR data have no total series; they are split by loan size and by
+    initial rate fixation. The total is the published total if any, otherwise
+    the sum of the size classes, otherwise the sum of the fixation buckets.
+    Months where any component is missing are left empty.
+    """
+    df = ecb.frame("MIR", f"M.{area}.B.A2A..B..2240.EUR.N")
+    parts = df["KEY"].str.split(".")
+    df = df.assign(fix=parts.str[5], amt=parts.str[7])
+    have = {(f, a): g for (f, a), g in df.groupby(["fix", "amt"])}
+
+    def series(f, a):
+        g = have[(f, a)]
+        return _series(g["OBS_VALUE"], g["TIME_PERIOD"], "M")
+
+    if ("A", "A") in have:
+        return series("A", "A"), "published total"
+    for combo in _AMOUNT_PARTS:
+        if all(("A", a) in have for a in combo):
+            s = pd.concat([series("A", a) for a in combo], axis=1).dropna().sum(axis=1)
+            return s, "sum of loan-size classes " + "+".join(combo)
+    for combo in _FIXATION_PARTS:
+        if all((f, "A") in have for f in combo):
+            s = pd.concat([series(f, "A") for f in combo], axis=1).dropna().sum(axis=1)
+            return s, "sum of rate-fixation buckets " + "+".join(combo)
+    raise DataError(f"MIR {area}: no complete breakdown of new loans to firms "
+                    f"(published: {sorted(have)[:12]})")
+
+
 def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int, end_year: int,
              client=None, ecb=None) -> Dict[str, Task]:
     """Tasks for the new euro-area or member-state variables in ``vars_set``.
@@ -875,11 +917,17 @@ def eu_tasks(geo: str, requested_ea: bool, vars_set, freq: str, start_year: int,
         return _ecb_monthly(ec(), "MIR", f"M.{area}.B.{item}.A.B.A.{sector}.EUR.N")
 
     def firms():
-        s = mir("A2A", "2240")
-        return _cand("ECB", f"MIR.M.{area}.B.A2A.A.B.A.2240.EUR.N", "ECB", convert(s, freq, "sum"), "M",
+        if kind == "EA":
+            s = mir("A2A", "2240")
+            return _cand("ECB", f"MIR.M.{area}.B.A2A.A.B.A.2240.EUR.N", "ECB", convert(s, freq, "sum"), "M",
+                         TIER_OFFICIAL, "New business volumes of bank loans to non-financial corporations "
+                         "(excluding revolving loans and overdrafts), million euro: monthly flows, summed over "
+                         "quarters and years (only complete periods). From January 2003.")
+        s, how = mir_firms_total(ec(), area)
+        return _cand("ECB", f"MIR.M.{area}.B.A2A.*.B.*.2240.EUR.N", "ECB", convert(s, freq, "sum"), "M",
                      TIER_OFFICIAL, "New business volumes of bank loans to non-financial corporations (excluding "
-                     "revolving loans and overdrafts), million euro: monthly flows, summed over quarters and years "
-                     "(only complete periods). From January 2003.")
+                     f"revolving loans and overdrafts), million euro: {how}. Monthly flows, summed over quarters "
+                     "and years (only complete periods).")
     add("loans_firms", [("MIR A2A", firms)])
 
     def households():
