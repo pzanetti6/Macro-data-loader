@@ -5,6 +5,7 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
+import altair as alt
 import streamlit as st
 
 import importlib
@@ -13,7 +14,7 @@ import macro_core as mc
 import macro_extra
 import excel_tools
 
-APP_VERSION = "26.5"
+APP_VERSION = "26.6"
 # A hosted app can keep previously imported modules in memory after the repository
 # is updated; reload any helper module whose version does not match this script.
 for _mod in (mc, macro_extra, excel_tools):
@@ -291,23 +292,12 @@ def run_checks(df: pd.DataFrame, freq: str) -> list:
     return out
 
 
-def chart_frame(df: pd.DataFrame, cols: list, freq: str, scale: str):
-    x = df[["date"] + cols].copy()
-    x.index = time_index(x["date"], freq)
-    x = x[cols].apply(pd.to_numeric, errors="coerce")
-    x = x[~x.index.isna()]
-    skipped = []
-    if scale == "Index, first common period = 100" and cols:
-        common = x.dropna()
-        # without a period shared by all series, each one is indexed to its own first observation
-        base = common.iloc[0] if not common.empty else x.apply(lambda c: c.dropna().iloc[0] if c.notna().any()
-                                                               else np.nan)
-        keep = [c for c in cols if base[c] > 0]
-        skipped = [c for c in cols if c not in keep]
-        x = x[keep].div(base[keep]).mul(100.0)
-    elif scale == "Standardised (z-score)":
-        x = (x - x.mean()) / x.std(ddof=0)
-    return x, skipped
+def chart_frame(df: pd.DataFrame, col: str, freq: str) -> pd.DataFrame:
+    """One series on a datetime index, missing periods removed."""
+    x = pd.DataFrame({"value": pd.to_numeric(df[col], errors="coerce").to_numpy(),
+                      "label": df["date"].astype(str).to_numpy()},
+                     index=time_index(df["date"], freq))
+    return x[~x.index.isna()].dropna(subset=["value"])
 
 
 def secret_fred_key() -> str:
@@ -365,14 +355,14 @@ def guilloche_svg(width: int = 1200, height: int = 120, strands: int = 12) -> st
 CSS = """
 <style>
 :root { --ink:#15302E; --ink-2:#4B6461; --intaglio:#0F5B52; --line:#9DBAB2; --bronze:#A07C00; --rule:#D3DDD9; }
-.block-container, [data-testid="stMainBlockContainer"] { max-width: 1240px; padding-top: 2.6rem; padding-bottom: 5rem; }
+.block-container, [data-testid="stMainBlockContainer"] { max-width: 1240px; padding-top: 1.1rem; padding-bottom: 5rem; }
 [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] { display: none; }
 header[data-testid="stHeader"] { background: transparent; }
-.hero h1 { font-family: Spectral, Georgia, serif; font-weight: 400; font-size: clamp(2.5rem, 6vw, 3.9rem);
+.hero h1 { font-family: Spectral, Georgia, serif; font-weight: 400; font-size: clamp(2.1rem, 4.6vw, 3.1rem);
            letter-spacing: -0.025em; line-height: 1.0; margin: 0; padding: 0; color: var(--ink); }
 .hero a { color: var(--intaglio); text-decoration: underline; text-underline-offset: 2px; }
-.hero p { max-width: none; color: var(--ink-2); font-size: 1.06rem; line-height: 1.6; margin: .9rem 0 0 0; }
-.guilloche { width: 100%; height: 112px; display: block; margin: 1.6rem 0 .5rem 0; overflow: visible; }
+.hero p { max-width: none; color: var(--ink-2); font-size: .92rem; line-height: 1.5; margin: .45rem 0 0 0; }
+.guilloche { width: 100%; height: 64px; display: block; margin: .8rem 0 .2rem 0; overflow: visible; }
 .guilloche path { fill: none; stroke-width: .75; vector-effect: non-scaling-stroke;
                   stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw 2.4s cubic-bezier(.3,.6,.2,1) forwards; }
 .guilloche .g-line { stroke: var(--line); }
@@ -393,7 +383,7 @@ header[data-testid="stHeader"] { background: transparent; }
 .result-title { font-family: Spectral, Georgia, serif; font-weight: 500; font-size: 1.9rem; color: var(--ink); margin: 3rem 0 .2rem 0; }
 .result-sub { color: var(--ink-2); font-size: .95rem; margin-bottom: 1rem; }
 .footnote { color: var(--ink-2); font-size: .84rem; }
-@media (max-width: 640px) { .step-sub { margin-left: 0; } .guilloche { height: 80px; } }
+@media (max-width: 640px) { .step-sub { margin-left: 0; } .guilloche { height: 48px; } }
 </style>
 """
 
@@ -438,7 +428,7 @@ def _set_countries(value):
 if geography == "Euro-area countries":
     pick_kw = {"wrap": True} if "wrap" in _PILL_PARAMS else {}
     if "country_pick" not in st.session_state:
-        pick_kw["default"] = COUNTRY_ORDER
+        pick_kw["default"] = []          # start empty: the user clicks the countries they want
     countries = st.pills("Countries", COUNTRY_ORDER, selection_mode="multi", key="country_pick",
                          format_func=lambda c: COUNTRY_NAMES.get(c, c), **pick_kw) or []
     countries = [c for c in EA19 if c in countries]          # keep the usual code order in the output
@@ -738,39 +728,40 @@ if res:
         @st.fragment
         def chart_panel():
             if len(datasets) > 1:
-                cc1, cc2 = st.columns([1, 3], gap="medium")
+                cc1, cc2, _ = st.columns([1, 1.6, 1.4], gap="medium")
                 with cc1:
                     cgeo = st.selectbox("Sheet", list(datasets), key="chart_geo",
                                         format_func=lambda g: COUNTRY_NAMES.get(g, g))
             else:
-                cc2 = st.container()
+                cc2, _ = st.columns([1.6, 2.4], gap="medium")
                 cgeo = next(iter(datasets))
             cdf = datasets[cgeo]
             options = value_columns(cdf)
             with cc2:
-                picks = st.multiselect("Series (up to six)", options, default=options[:1], max_selections=6,
-                                       format_func=lambda c: rlabels.get(c, c), key="chart_vars")
-            scale = segmented("Scale", ["Original units", "Index, first common period = 100", "Standardised (z-score)"],
-                              "Original units", "chart_scale")
-            if not picks:
-                st.caption("Choose one or more series to plot.")
+                pick = st.selectbox("Series", options, key="chart_var",
+                                    format_func=lambda c: rlabels.get(c, c))
+            if pick is None:
+                st.caption("This sheet has no series to plot.")
                 return
-            frame, skipped = chart_frame(cdf, picks, rfreq, scale)
-            frame = frame.rename(columns=lambda c: rlabels.get(c, c))
-            if frame.dropna(how="all").empty:
-                st.caption("These series have no overlapping observations to plot.")
+            frame = chart_frame(cdf, pick, rfreq)
+            if frame.empty:
+                st.caption(f"{rlabels.get(pick, pick)} has no observations in this window; the source cell says why.")
                 return
-            # long format without missing values: every series is drawn as one continuous line,
-            # even when it has gaps or is published less often than the sheet's frequency
-            long = (frame.rename_axis("period").reset_index()
-                    .melt("period", var_name="series", value_name="value").dropna(subset=["value"]))
-            st.line_chart(long, x="period", y="value", color="series", height=380, width="stretch",
-                          x_label="", y_label="")
-            span = frame.dropna(how="all").index
-            st.caption(f"{span.min():%b %Y} to {span.max():%b %Y}. "
-                       + ("Series in different units share one axis here; switch the scale to compare their shape. "
-                          if scale == "Original units" and len(picks) > 1 else "")
-                       + (f"Not indexed (non-positive base value): {', '.join(skipped)}." if skipped else ""))
+            # missing periods are dropped so the line runs continuously through gaps
+            data = frame.rename_axis("period").reset_index()
+            label = rlabels.get(pick, pick)
+            chart = (alt.Chart(data).mark_line(strokeWidth=2, color="#0F5B52")
+                     .encode(x=alt.X("period:T", title=None),
+                             y=alt.Y("value:Q", title=None, scale=alt.Scale(zero=False)),   # fit the data, not zero
+                             tooltip=[alt.Tooltip("label:N", title="Period"),
+                                      alt.Tooltip("value:Q", title=label, format=",.4~f")])
+                     .properties(height=380))
+            hover = (alt.Chart(data).mark_point(size=60, color="#0F5B52", filled=True, opacity=0)
+                     .encode(x="period:T", y="value:Q",
+                             tooltip=[alt.Tooltip("label:N", title="Period"),
+                                      alt.Tooltip("value:Q", title=label, format=",.4~f")]))
+            st.altair_chart(chart + hover, width="stretch", theme="streamlit")
+            st.caption(f"{label}, {frame['label'].iloc[0]} to {frame['label'].iloc[-1]}, {len(frame)} observations.")
 
         chart_panel()
 

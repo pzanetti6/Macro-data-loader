@@ -111,6 +111,11 @@ Requests are spaced to respect FRED's rate limit, retried on 429/5xx errors, and
 
 ## Changelog
 
+### v26.6
+- Shorter header: smaller subtitle, tighter spacing.
+- Euro-area countries start with none selected; click the ones you want (All and None remain).
+- The chart shows one series at a time, chosen from a dropdown, with an axis fitted to the data and hover values.
+
 ### v26.5
 - **Country M1, M2 and M3 repeat the euro-area aggregates** (the ECB publishes no national monetary aggregates); the source cell says so.
 

@@ -20,7 +20,7 @@ import pandas as pd
 
 import macro_core as mc
 
-VERSION = "26.5"
+VERSION = "26.6"
 from macro_core import DataError, FetchMeta, redact
 
 # ---------------------------------------------------------------------------
